@@ -1,6 +1,6 @@
 # Bund
 
-A Rust coding agent with an inline terminal interface and a reusable Rust SDK.
+A Rust coding agent with a fullscreen terminal interface and a reusable Rust SDK.
 Bund reads a repository, proposes focused changes, asks before edits and host
 commands, runs configured checks, and saves sessions for later continuation.
 Use Anthropic Messages or OpenAI Responses with your own API credentials.
@@ -38,7 +38,8 @@ bund --provider anthropic --model YOUR_MODEL_ID --workspace /path/to/repository
 
 Ask for a small change, such as “Find the date parser, add a regression test for
 empty input, and fix it.” Bund streams progress, previews patches and requests
-approval for host commands. **Ctrl+Y approves once; Ctrl+N or Esc denies.**
+approval for host commands. In the query box, press **1** to approve once,
+**2** to approve for this session, or **3** to tell Bund what to do differently.
 
 API credentials and models are unnecessary for help, listing sessions, or local
 inspection. `bund` can open without credentials; configure a model before
@@ -57,17 +58,34 @@ The current directory becomes the workspace; no launcher script is required.
 
 ## Terminal workflow
 
-The interface stays on the primary terminal screen, with a bordered composer
-at the bottom that remains visible while work runs and approvals are pending.
-Completed text remains in native scrollback after exit. Enter submits, Alt+Enter or Ctrl+J inserts a
-newline, Tab completes slash commands and `@path` references, and Up/Down recalls
-history on a single-line draft. An `@path` identifies a file for the agent to
-read; it does not silently attach file contents.
+The fullscreen interface shows workspace, model, run status, and keyboard
+controls at the top, a scrollable conversation in the middle, and a cyan
+bordered query box fixed at the bottom. The query box keeps your draft visible
+while work runs; approval choices temporarily replace it without losing the
+draft or cursor. Enter submits, Alt+Enter or Ctrl+J
+inserts a newline, Tab completes slash commands and `@path` references, and
+Up/Down recalls history on a single-line draft. An `@path` identifies a file for
+the agent to read; it does not silently attach file contents.
+
+Routine activity is collapsed by default. **Ctrl+O** expands or collapses
+orange activity boxes beneath the corresponding responses, including tools
+and any reasoning summary supplied by the provider. A model may provide no
+reasoning summary. The mouse wheel and **PageUp/PageDown** scroll Bund's
+conversation and pause following new output; **Ctrl+End** returns to the latest
+output. Expanding activity preserves your place in the conversation and your
+draft.
+
+Drag over response text to highlight it, then release to copy to your clipboard.
+Copied text preserves displayed line breaks and omits speaker dots. On Linux,
+this requires `wl-copy` (Wayland), `xclip`, or `xsel` (X11).
 
 Typing while a run is active preserves a draft. A busy submission keeps that
-draft; queued steering is future work. Esc/Ctrl+C cancels active work and its
-command process group. At idle, Ctrl+C clears a draft, then exits on an empty
-draft. Ctrl+D on an empty composer or `/exit` also exits.
+draft; queued steering is future work. Esc cancels active work, denies from the
+approval choices, or returns from guidance to those choices. To close the interactive interface, press **Ctrl+C twice
+consecutively within 1.5 seconds**. The first press cancels active work and its
+command process group while preserving your draft; the second exits. Other
+input or the timeout resets the exit confirmation. Ctrl+D and `/exit` display
+this shortcut without closing the interface.
 
 | Command | Behavior |
 | --- | --- |
@@ -80,9 +98,31 @@ draft. Ctrl+D on an empty composer or `/exit` also exits.
 | `/check` | Run configured validation commands through normal permissions |
 | `/skill PATH` | Invoke a workspace Markdown skill; directories use SKILL.md |
 | `/accept-edits on\|off` | Control direct-edit approvals for this session |
-| `/exit` | Cancel active work, restore the terminal, and exit |
+| `/exit` | Show the two-press Ctrl+C exit shortcut |
 
-Long approval previews can be paged in the inline region. Project `AGENTS.md`
+Approval choices appear inside the query box: **1 Approve once**,
+**2 Approve for this session**, and **3 Tell Bund what to do differently**.
+Use Up/Down to select a choice and Enter to answer; 1 and 2 also approve
+immediately. The final choice is a gray placeholder in an inline input. Arrow
+down to it or press 3 and start typing. Enter in the input declines the proposed
+action and sends the guidance to Bund. Up from the first line or Esc returns to
+the session-approval choice without
+losing the guidance; Down focuses it again.
+Your original draft and cursor return after the decision or cancellation.
+Ctrl+Y approves once; Ctrl+N or Esc from the choices denies without feedback.
+While an approval is pending, the mouse wheel and PageUp/PageDown scroll its
+preview in the middle of the screen; Ctrl+O still toggles activity. Exiting
+restores your previous terminal screen. Use `bund sessions` and
+`bund resume SESSION_ID` to revisit saved conversations.
+
+For a workspace edit, **Approve for this session** allows later workspace edits
+in that saved session. For a command, it allows only the exact command and
+working directory you reviewed; different commands or directories still need
+approval. These grants survive resuming the same session ID and do not carry
+into a new session or change user configuration. Plan mode still blocks edits
+and shell commands. Use `/accept-edits off` to restore edit approvals.
+
+Project `AGENTS.md`
 guidance loads by directory scope; `CLAUDE.md` is the fallback at a directory
 without `AGENTS.md`. Instructions and skills never grant execution permission.
 
@@ -279,7 +319,7 @@ workflow artifacts; it does not automatically publish a GitHub release.
 
 This MVP includes one agent, both native API adapters, reviewed workspace tools,
 durable sessions, configured checks, simple skills, and the embeddable engine.
-Its inline transcript uses basic styling rather than a rich Markdown viewer.
+Its fullscreen transcript uses basic styling rather than a rich Markdown viewer.
 MCP, general hooks, sandbox backends, subagents, desktop/IDE clients, schedules,
 plugins and additional model providers are future work.
 

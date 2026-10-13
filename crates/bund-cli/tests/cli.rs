@@ -308,7 +308,7 @@ fn provider_override_does_not_inherit_another_providers_config_endpoint() {
 
 #[cfg(unix)]
 #[test]
-fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
+fn fullscreen_pty_resumes_policy_and_restores_shell_after_tiny_resize() {
     use nix::{
         fcntl::{fcntl, FcntlArg, OFlag},
         pty::{openpty, Winsize},
@@ -345,7 +345,7 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
     let pair = openpty(
         Some(&Winsize {
             ws_row: 24,
-            ws_col: 80,
+            ws_col: 160,
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),
@@ -363,7 +363,7 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
     let mut command = Command::new("/bin/sh");
     command.args([
         "-c",
-        "\"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
+        "printf 'SHELL_BEFORE_BUND\\n'; \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
         "bund-pty-wrapper",
     ]);
     command.arg(bund.get_program()).args(bund.get_args());
@@ -376,6 +376,8 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
     }
     command
         .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR")
         .stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave.try_clone().unwrap());
@@ -393,15 +395,16 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received = Vec::new();
+    let mut screen = vt100::Parser::new(24, 160, 1000);
     let mut cursor_scan = 0;
-    let mut sent = false;
-    let mut exiting = false;
+    let mut stage = 0;
     let mut restored = false;
     loop {
         let mut buffer = [0; 8192];
         match master.read(&mut buffer) {
             Ok(n) => {
                 received.extend_from_slice(&buffer[..n]);
+                screen.process(&buffer[..n]);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
@@ -414,13 +417,51 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
                 cursor_scan += 1;
             }
         }
-        if !sent && String::from_utf8_lossy(&received).contains("/help for commands") {
+        let contents = screen.screen().contents();
+        if stage == 0 && contents.contains("Ask bund") {
+            assert!(screen.screen().alternate_screen());
+            let header = screen
+                .screen()
+                .rows(0, 160)
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(header.contains("edits auto"), "{header}");
+            assert!(
+                header.contains("shell reviewed (1 exact grants)"),
+                "{header}"
+            );
             master.write_all(b"/help\r").unwrap();
-            sent = true;
+            stage = 1;
         }
-        if sent && !exiting && String::from_utf8_lossy(&received).contains("cannot be undone") {
+        if stage == 1 && contents.contains("cannot be undone") {
             master.write_all(b"\x1b[200~draft\nkept\x1b[201~").unwrap();
-            thread::sleep(Duration::from_millis(100));
+            stage = 2;
+        }
+        if stage == 2 && contents.contains("draft") && contents.contains("kept") {
+            let size = Winsize {
+                ws_row: 8,
+                ws_col: 24,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            unsafe {
+                assert_eq!(
+                    nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &size),
+                    0
+                );
+            }
+            screen.screen_mut().set_size(8, 24);
+            stage = 3;
+        }
+        if stage == 3
+            && screen.screen().cell(7, 0).unwrap().contents() == "╰"
+            && screen
+                .screen()
+                .rows(0, 24)
+                .skip(5)
+                .any(|line| line.contains("kept"))
+        {
             let size = Winsize {
                 ws_row: 16,
                 ws_col: 50,
@@ -428,11 +469,41 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
                 ws_ypixel: 0,
             };
             unsafe {
-                nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &size);
+                assert_eq!(
+                    nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &size),
+                    0
+                );
             }
-            thread::sleep(Duration::from_millis(100));
-            master.write_all(b"\x03/exit\r").unwrap();
-            exiting = true;
+            screen.screen_mut().set_size(16, 50);
+            stage = 4;
+        }
+        if stage == 4
+            && screen.screen().cell(15, 0).unwrap().contents() == "╰"
+            && screen
+                .screen()
+                .rows(0, 50)
+                .skip(11)
+                .any(|line| line.contains("draft"))
+            && screen
+                .screen()
+                .rows(0, 50)
+                .skip(11)
+                .any(|line| line.contains("kept"))
+        {
+            master.write_all(b"\x03").unwrap();
+            stage = 5;
+        }
+        if stage == 5 && contents.contains("Press Ctrl+C again to exit") {
+            assert!(screen.screen().alternate_screen());
+            let editor = screen
+                .screen()
+                .rows(0, 50)
+                .skip(11)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(editor.contains("draft") && editor.contains("kept"));
+            master.write_all(b"\x03").unwrap();
+            stage = 6;
         }
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "{}", String::from_utf8_lossy(&received));
@@ -440,30 +511,32 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
         }
         if !restored && String::from_utf8_lossy(&received).contains("BUND_DONE") {
             let after = tcgetattr(&slave).unwrap();
+            assert_eq!(before, after, "terminal modes must be restored");
+            assert!(!screen.screen().alternate_screen());
             assert_eq!(
-                before.local_flags, after.local_flags,
-                "raw mode must be restored"
+                screen.screen().mouse_protocol_mode(),
+                vt100::MouseProtocolMode::None
             );
+            assert!(screen.screen().contents().contains("SHELL_BEFORE_BUND"));
             restored = true;
             master.write_all(b"done\n").unwrap();
         }
         if Instant::now() >= deadline {
-            child.kill().unwrap();
+            unsafe {
+                nix::libc::kill(-(child.id() as i32), nix::libc::SIGKILL);
+            }
             let _ = child.wait();
             panic!("PTY timed out: {}", String::from_utf8_lossy(&received));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(sent && exiting && restored);
+    assert!(stage == 6 && restored);
     assert!(
-        !received.windows(8).any(|w| w == b"\x1b[?1049h"),
-        "must not enter alternate screen"
+        received.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "must enter alternate screen"
     );
-    assert!(String::from_utf8_lossy(&received).contains("draft"));
-    let visible = bund_cli::output::clean(&String::from_utf8_lossy(&received));
-    assert!(visible.contains("edits auto"), "{visible}");
     assert!(
-        visible.contains("shell reviewed (1 exact grants)"),
-        "{visible}"
+        received.windows(8).any(|w| w == b"\x1b[?1049l"),
+        "must leave alternate screen"
     );
 }

@@ -257,6 +257,43 @@ impl SessionHandle {
         Ok(())
     }
     pub async fn answer_approval(&self, id: &str, decision: ApprovalDecision) -> Result<()> {
+        if decision == ApprovalDecision::ApproveSession {
+            let state = self.inner.state.lock().await;
+            let request = state
+                .pending_approval
+                .as_ref()
+                .filter(|request| request.id == id)
+                .ok_or_else(|| Error::Invalid("approval is stale or unknown".into()))?;
+            let definition = self
+                .inner
+                .tools
+                .get(&request.tool_call.name)
+                .map(|tool| tool.definition());
+            let supported = match (&request.session_scope, definition) {
+                (Some(SessionApprovalScope::WorkspaceEdits), Some(definition)) => {
+                    definition.effect == Effect::Write
+                }
+                (Some(SessionApprovalScope::Command { .. }), Some(definition)) => {
+                    request.tool_call.name == "run_command" && definition.effect == Effect::Execute
+                }
+                _ => false,
+            };
+            if state.options.policy.mode == Mode::Plan || !supported {
+                return Err(Error::Invalid(
+                    "this action does not support approval for the session".into(),
+                ));
+            }
+        }
+        if let ApprovalDecision::DenyWithFeedback { feedback } = &decision {
+            if feedback.trim().is_empty() {
+                return Err(Error::Invalid("approval feedback must not be blank".into()));
+            }
+            if feedback.len() > MAX_APPROVAL_FEEDBACK_BYTES {
+                return Err(Error::Invalid(format!(
+                    "approval feedback exceeds {MAX_APPROVAL_FEEDBACK_BYTES} bytes"
+                )));
+            }
+        }
         let mut pending = self.inner.approval.lock().await;
         if pending
             .as_ref()
@@ -406,7 +443,22 @@ impl Session {
         self.approval.lock().await.take();
         state.pending_approval = None;
         let (status, message) = match result {
-            Ok(message) => (RunStatus::Completed, message),
+            Ok((message, response_id)) => {
+                if let Err(error) = self
+                    .emit(
+                        &mut state,
+                        EventKind::RunOutput {
+                            response_id,
+                            text: message.clone(),
+                        },
+                    )
+                    .await
+                {
+                    (RunStatus::Failed, error.to_string())
+                } else {
+                    (RunStatus::Completed, message)
+                }
+            }
             Err(Error::Cancelled) => (
                 RunStatus::Cancelled,
                 "Cancelled; any completed edits remain on disk.".into(),
@@ -454,9 +506,13 @@ impl Session {
         }
     }
 
-    async fn perform(&self, operation: Operation, cancel: CancellationToken) -> Result<String> {
-        match operation {
-            Operation::Prompt => self.agent_loop(cancel).await,
+    async fn perform(
+        &self,
+        operation: Operation,
+        cancel: CancellationToken,
+    ) -> Result<(String, Option<String>)> {
+        let text = match operation {
+            Operation::Prompt => return self.agent_loop(cancel).await,
             Operation::Compact => {
                 self.compact_history(cancel, true).await?;
                 Ok("Context compacted.".into())
@@ -492,7 +548,8 @@ impl Session {
                 self.store.commit(&state, &[]).await?;
                 Ok(result)
             }
-        }
+        }?;
+        Ok((text, None))
     }
 
     async fn host_tool(
@@ -523,7 +580,7 @@ impl Session {
         Ok(output.content)
     }
 
-    async fn agent_loop(&self, cancel: CancellationToken) -> Result<String> {
+    async fn agent_loop(&self, cancel: CancellationToken) -> Result<(String, Option<String>)> {
         let max_rounds = self.state.lock().await.options.limits.max_rounds;
         let mut checks_current = false;
         let mut changed = false;
@@ -533,7 +590,9 @@ impl Session {
             }
             self.compact_history(cancel.clone(), false).await?;
             let request = self.request().await?;
-            let response = self.provider_call(request, cancel.clone()).await?;
+            let (response_id, response) = self
+                .provider_call(request, cancel.clone(), ResponsePurpose::Conversation)
+                .await?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -607,11 +666,22 @@ impl Session {
                     continue;
                 }
                 if changed && self.state.lock().await.validation == ValidationStatus::Failed {
+                    // The completed explanation is still the final answer even
+                    // though validation makes the overall run unsuccessful.
+                    let mut state = self.state.lock().await;
+                    self.emit(
+                        &mut state,
+                        EventKind::RunOutput {
+                            response_id: Some(response_id),
+                            text: response.text,
+                        },
+                    )
+                    .await?;
                     return Err(Error::Invalid(
                         "work ended with failing validation checks".into(),
                     ));
                 }
-                return Ok(response.text);
+                return Ok((response.text, Some(response_id)));
             }
             for call in calls {
                 let result = if let Some(tool) = self.tools.get(&call.name).cloned() {
@@ -705,7 +775,8 @@ impl Session {
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
-    ) -> Result<ProviderResponse> {
+        purpose: ResponsePurpose,
+    ) -> Result<(String, ProviderResponse)> {
         request
             .profile
             .validate_capabilities(!request.tools.is_empty())?;
@@ -713,6 +784,18 @@ impl Session {
             .providers
             .get(&request.profile.provider)
             .ok_or_else(|| Error::Invalid("provider not configured".into()))?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut state = self.state.lock().await;
+            self.emit(
+                &mut state,
+                EventKind::ResponseStarted {
+                    id: id.clone(),
+                    purpose,
+                },
+            )
+            .await?;
+        }
         let (tx, mut rx) = mpsc::channel(64);
         let work = provider.complete(request, tx, cancel.clone());
         tokio::pin!(work);
@@ -723,10 +806,10 @@ impl Session {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                _ = tick.tick(), if !pending_text.is_empty() => { self.flush_text(&mut pending_text).await?; }
+                _ = tick.tick(), if !pending_text.is_empty() => { self.flush_text(&mut pending_text, &id, purpose).await?; }
                 event = rx.recv(), if !rx.is_closed() || !rx.is_empty() => {
                     if let Some(event) = event {
-                        self.provider_progress(event, &mut pending_text).await?;
+                        self.provider_progress(event, &mut pending_text, &id, purpose).await?;
                     }
                 }
                 result = &mut work => {
@@ -734,10 +817,16 @@ impl Session {
                     // complete in the same turn, after recv() was polled empty.
                     // Drain those before publishing the completed response.
                     while let Ok(event) = rx.try_recv() {
-                        self.provider_progress(event, &mut pending_text).await?;
+                        self.provider_progress(event, &mut pending_text, &id, purpose).await?;
                     }
-                    self.flush_text(&mut pending_text).await?;
-                    return result;
+                    self.flush_text(&mut pending_text, &id, purpose).await?;
+                    let response = result?;
+                    let mut state = self.state.lock().await;
+                    self.emit(&mut state, EventKind::ResponseCompleted {
+                        id: id.clone(), purpose, text: response.text.clone(),
+                        reasoning: response.reasoning.clone(), tool_calls: response.tool_calls.clone(),
+                    }).await?;
+                    return Ok((id, response));
                 }
             }
         }
@@ -747,30 +836,57 @@ impl Session {
         &self,
         event: ProviderEvent,
         pending_text: &mut String,
+        id: &str,
+        purpose: ResponsePurpose,
     ) -> Result<()> {
         match event {
             ProviderEvent::TextDelta(text) => {
                 pending_text.push_str(&text);
                 if pending_text.len() >= 4096 {
-                    self.flush_text(pending_text).await?;
+                    self.flush_text(pending_text, id, purpose).await?;
                 }
             }
             ProviderEvent::ReasoningSummary(text) => {
-                self.flush_text(pending_text).await?;
+                self.flush_text(pending_text, id, purpose).await?;
                 let mut state = self.state.lock().await;
-                self.emit(&mut state, EventKind::ReasoningSummary { text })
-                    .await?;
+                self.emit(
+                    &mut state,
+                    EventKind::ResponseReasoningDelta {
+                        id: id.into(),
+                        text: text.clone(),
+                    },
+                )
+                .await?;
+                if purpose == ResponsePurpose::Conversation {
+                    self.emit(&mut state, EventKind::ReasoningSummary { text })
+                        .await?;
+                }
             }
             ProviderEvent::Retrying { .. } => {}
         }
         Ok(())
     }
 
-    async fn flush_text(&self, buffer: &mut String) -> Result<()> {
+    async fn flush_text(
+        &self,
+        buffer: &mut String,
+        id: &str,
+        purpose: ResponsePurpose,
+    ) -> Result<()> {
         if !buffer.is_empty() {
             let text = std::mem::take(buffer);
             let mut state = self.state.lock().await;
-            self.emit(&mut state, EventKind::TextDelta { text }).await?;
+            self.emit(
+                &mut state,
+                EventKind::ResponseTextDelta {
+                    id: id.into(),
+                    text: text.clone(),
+                },
+            )
+            .await?;
+            if purpose == ResponsePurpose::Conversation {
+                self.emit(&mut state, EventKind::TextDelta { text }).await?;
+            }
         }
         Ok(())
     }
@@ -812,6 +928,7 @@ impl Session {
             ));
         }
         let prepared = tool.prepare(&context, call.arguments.clone()).await?;
+        let session_scope = session_approval_scope(&call, definition.effect, &prepared);
         {
             let mut state = self.state.lock().await;
             self.emit(
@@ -825,31 +942,30 @@ impl Session {
         }
         let allowed = definition.effect == Effect::Read
             || (definition.effect == Effect::Write && policy.accept_edits)
-            || (call.name == "run_command"
-                && definition.effect == Effect::Execute
-                && prepared
-                    .arguments
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|cwd| cwd == "." || cwd.is_empty())
-                && prepared
-                    .arguments
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|command| {
-                        policy
-                            .allowed_commands
-                            .iter()
-                            .any(|allowed| allowed == command)
-                    }));
+            || matches!(&session_scope, Some(SessionApprovalScope::Command { command, cwd })
+                if (cwd == "." && policy.allowed_commands.contains(command))
+                    || policy.session_commands.iter().any(|grant| &grant.command == command && &grant.cwd == cwd));
+        let mut session_grant = None;
         if !allowed {
+            let preview = match &session_scope {
+                Some(SessionApprovalScope::WorkspaceEdits) => format!(
+                    "Approve for this session: allow workspace edits in this saved session. Shell commands still require their own approval.\n\n{}",
+                    prepared.preview
+                ),
+                Some(SessionApprovalScope::Command { command, cwd }) => format!(
+                    "Approve for this session: allow only this exact command in this directory, in this saved session.\nDirectory: {cwd}\nCommand: {command}\n\n{}",
+                    prepared.preview
+                ),
+                None => prepared.preview.clone(),
+            };
             let request = ApprovalRequest {
                 id: Uuid::new_v4().to_string(),
                 run_id,
                 tool_call: call.clone(),
-                preview: prepared.preview.clone(),
+                preview,
                 fingerprint: prepared.fingerprint.clone(),
                 workspace: context.workspace.clone(),
+                session_scope,
             };
             let (sender, receiver) = oneshot::channel();
             *self.approval.lock().await = Some((request.id.clone(), sender));
@@ -869,13 +985,27 @@ impl Session {
                     &mut state,
                     EventKind::ApprovalResolved {
                         id: request.id,
-                        decision,
+                        decision: decision.clone(),
                     },
                 )
                 .await?;
             }
-            if decision == ApprovalDecision::Deny {
-                return Err(Error::Denied(format!("user denied {}", call.name)));
+            match decision {
+                ApprovalDecision::ApproveOnce => {}
+                ApprovalDecision::ApproveSession => {
+                    session_grant = Some(request.session_scope.ok_or_else(|| {
+                        Error::Invalid("this action does not support session approval".into())
+                    })?);
+                }
+                ApprovalDecision::Deny => {
+                    return Err(Error::Denied(format!("user denied {}", call.name)));
+                }
+                ApprovalDecision::DenyWithFeedback { feedback } => {
+                    return Err(Error::Denied(format!(
+                        "user denied {}.\nUser guidance for your next action:\n{feedback}",
+                        call.name
+                    )));
+                }
             }
         }
         if cancel.is_cancelled() {
@@ -886,6 +1016,32 @@ impl Session {
             return Err(Error::Denied(
                 "action changed since approval; request a new action".into(),
             ));
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(scope) = session_grant {
+            let mut state = self.state.lock().await;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let previous_policy = state.options.policy.clone();
+            match scope {
+                SessionApprovalScope::WorkspaceEdits => state.options.policy.accept_edits = true,
+                SessionApprovalScope::Command { command, cwd } => {
+                    let grant = CommandGrant { command, cwd };
+                    if !state.options.policy.session_commands.contains(&grant) {
+                        state.options.policy.session_commands.push(grant);
+                    }
+                }
+            }
+            if let Err(error) = self.emit(&mut state, EventKind::SettingsChanged).await {
+                state.options.policy = previous_policy;
+                return Err(error);
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         {
             let mut state = self.state.lock().await;
@@ -1077,7 +1233,9 @@ impl Session {
         if estimate_context(&summarize.instructions, &summarize.messages, &[])? >= available {
             return Err(Error::ContextLimit("history is too large to summarize with this profile; use a larger context window or a fresh session".into()));
         }
-        let response = self.provider_call(summarize, cancel).await?;
+        let (_, response) = self
+            .provider_call(summarize, cancel, ResponsePurpose::Compaction)
+            .await?;
         if !response.tool_calls.is_empty() || response.text.trim().is_empty() {
             return Err(Error::ContextLimit(
                 "provider failed to produce a usable summary; history retained".into(),
@@ -1105,6 +1263,25 @@ impl Session {
         self.emit(&mut state, EventKind::ContextCompacted { summary })
             .await
     }
+}
+
+fn session_approval_scope(
+    call: &ToolCall,
+    effect: Effect,
+    prepared: &PreparedTool,
+) -> Option<SessionApprovalScope> {
+    if effect == Effect::Write {
+        return Some(SessionApprovalScope::WorkspaceEdits);
+    }
+    if call.name != "run_command" || effect != Effect::Execute {
+        return None;
+    }
+    let command = prepared.arguments.get("command")?.as_str()?.to_owned();
+    let cwd = prepared.arguments.get("cwd")?.as_str()?;
+    Some(SessionApprovalScope::Command {
+        command,
+        cwd: if cwd.is_empty() { "." } else { cwd }.into(),
+    })
 }
 
 fn result_message(result: ToolResult) -> Message {

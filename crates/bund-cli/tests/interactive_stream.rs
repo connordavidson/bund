@@ -8,6 +8,7 @@ use nix::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -21,6 +22,14 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(30);
 const DRAFT: &str = "Continue 世界 e\u{301} 🦀\nkeep this draft";
+const PROMPT: &str = "begin fixture\nquery continuation 世界";
+const STREAMING: &str = "Streaming ready 界\nAssistant continuation 🦀\n";
+const REASONING: &str = "REASONING_ONLY_WHEN_EXPANDED\nInspect the workspace before editing.";
+const LATEST: &str = "NEW_OUTPUT_WHILE_BROWSING";
+const ORANGE: vt100::Color = vt100::Color::Rgb(255, 184, 108);
+const EXIT_CONFIRMATION: &str = "Press Ctrl+C again to exit";
+const EXIT_HELP: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
+const GUIDANCE_PLACEHOLDER: &str = "Tell Bund what to do differently";
 const HOSTILE: [&str; 3] = [
     "harmless \u{1b}[",
     "999;999Hvisible-safe\u{1b}]52;c;INERT_CLIPBOARD_MARKER",
@@ -49,9 +58,13 @@ fn delta(text: &str) -> String {
 }
 
 fn finish(id: &str, items: &[Value]) -> String {
+    finish_after(id, items, 1)
+}
+
+fn finish_after(id: &str, items: &[Value], started: usize) -> String {
     let mut output = String::new();
     for (index, item) in items.iter().enumerate() {
-        if index > 0 {
+        if index >= started {
             output +=
                 &sse(json!({"type":"response.output_item.added","output_index":index,"item":item}));
         }
@@ -130,13 +143,25 @@ fn fixture() -> Fixture {
     let worker = thread::spawn(move || {
         let (mut socket, request) = accept_request(&listener);
         requests_tx.send(request).unwrap();
-        let text = format!("Streaming ready 界\n{}", HOSTILE.concat());
+        let text = format!("{STREAMING}{}", HOSTILE.concat());
         let item = message("m1", &text);
-        let first = start("r1", &item) + &delta("Streaming ready 界\n");
+        let reasoning = json!({"type":"reasoning","id":"rs1",
+            "summary":[{"type":"summary_text","text":REASONING}],
+            "encrypted_content":"OPAQUE_REASONING_MUST_STAY_PRIVATE"});
+        let first = start("r1", &item)
+            + &sse(json!({"type":"response.output_item.added","output_index":1,"item":reasoning}))
+            + &sse(
+                json!({"type":"response.reasoning_summary_text.delta","output_index":1,
+                "item_id":"rs1","summary_index":0,"delta":REASONING}),
+            )
+            + &delta(STREAMING);
+        let proposed = (0..40)
+            .map(|i| format!("Proposed line {i:02}: must not be written\n"))
+            .collect::<String>();
         let call = json!({"type":"function_call","id":"fc1","call_id":"call1","name":"apply_patch",
-            "arguments":"{\"path\":\"created.txt\",\"content\":\"must not be written\"}","status":"completed"});
+            "arguments":json!({"path":"created.txt","content":proposed}).to_string(),"status":"completed"});
         let hostile = HOSTILE.iter().map(|text| delta(text)).collect::<String>();
-        let completed = finish("r1", &[item, call]);
+        let completed = finish_after("r1", &[item, reasoning, call], 2);
         header(&mut socket, first.len() + hostile.len() + completed.len());
         socket.write_all(first.as_bytes()).unwrap();
         socket.flush().unwrap();
@@ -162,10 +187,18 @@ fn fixture() -> Fixture {
 
         let (mut socket, request) = accept_request(&listener);
         requests_tx.send(request).unwrap();
-        let response = start("r3", &message("m3", "")) + &delta("Cancellation stream is active\n");
+        let rows = (0..45)
+            .map(|i| format!("Scroll row {i:02}\n"))
+            .collect::<String>();
+        let response = start("r3", &message("m3", ""))
+            + &delta(&format!("{rows}Cancellation stream is active\n"));
+        let later = delta(&format!("{LATEST}\n"));
         // Deliberately leave the response unfinished until the client cancels.
-        header(&mut socket, response.len() + 1000);
+        header(&mut socket, response.len() + later.len() + 1000);
         socket.write_all(response.as_bytes()).unwrap();
+        socket.flush().unwrap();
+        gates.recv_timeout(WAIT).unwrap();
+        socket.write_all(later.as_bytes()).unwrap();
         socket.flush().unwrap();
         gates.recv_timeout(WAIT).unwrap();
     });
@@ -188,6 +221,10 @@ struct Pty {
 
 impl Pty {
     fn spawn(dir: &Path, endpoint: &str) -> Self {
+        Self::spawn_session(dir, endpoint, None)
+    }
+
+    fn spawn_session(dir: &Path, endpoint: &str, resume: Option<&str>) -> Self {
         let pair = openpty(
             Some(&Winsize {
                 ws_row: 24,
@@ -210,7 +247,7 @@ impl Pty {
         command
             .args([
                 "-c",
-                "printf 'PREEXISTING_SCROLLBACK\\n'; \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
+                "printf 'PREEXISTING_SCROLLBACK\\n'; /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$BUND_TEST_PID_FILE\"; exec \"$@\"' bund-pid-wrapper \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
                 "bund-pty-wrapper",
             ])
             .arg(env!("CARGO_BIN_EXE_bund"))
@@ -230,10 +267,16 @@ impl Pty {
                 endpoint,
             ])
             .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("NO_COLOR")
             .env("OPENAI_API_KEY", "fixture-only-key")
+            .env("BUND_TEST_PID_FILE", dir.join("bund.pid"))
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
+        if let Some(id) = resume {
+            command.args(["resume", id]);
+        }
         for key in [
             "ANTHROPIC_API_KEY",
             "BUND_PROVIDER",
@@ -266,6 +309,14 @@ impl Pty {
         self.master.write_all(text.as_bytes()).unwrap();
     }
 
+    fn wheel(&mut self, down: bool) {
+        self.send(if down {
+            "\x1b[<65;10;10M"
+        } else {
+            "\x1b[<64;10;10M"
+        });
+    }
+
     fn pump(&mut self) {
         let mut buffer = [0; 8192];
         match self.master.read(&mut buffer) {
@@ -285,27 +336,87 @@ impl Pty {
         }
     }
 
-    fn wait_text(&mut self, after: usize, needle: &str) {
+    fn wait_screen(&mut self, label: &str, condition: impl Fn(&vt100::Screen) -> bool) {
         let deadline = Instant::now() + WAIT;
-        // Ratatui may skip blank cells with cursor moves; this capture is not a
-        // terminal emulator. Exact draft preservation is checked in the actual
-        // provider request below, independently of these progress markers.
-        let marker: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
         loop {
             self.pump();
-            let output = bund_cli::output::clean(&String::from_utf8_lossy(&self.received[after..]));
-            let searchable: String = output.chars().filter(|c| !c.is_whitespace()).collect();
-            if searchable.contains(&marker) {
+            if condition(self.screen.screen()) {
                 return;
             }
             assert!(
                 self.child.try_wait().unwrap().is_none(),
-                "bund exited while waiting for {needle:?}: {output}"
+                "bund exited while waiting for {label}: {}",
+                self.screen.screen().contents()
             );
             assert!(
                 Instant::now() < deadline,
-                "PTY timed out waiting for {needle:?}: {output}; raw={:?}",
-                String::from_utf8_lossy(&self.received)
+                "PTY timed out waiting for {label}: {}",
+                self.screen.screen().contents()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_visible(&mut self, text: &str) {
+        self.wait_screen(text, |screen| screen.contents().contains(text));
+    }
+
+    fn assert_occupied(&self) {
+        let screen = self.screen.screen();
+        assert!(
+            screen.alternate_screen(),
+            "Bund must own the terminal while open"
+        );
+        assert!(
+            !screen.contents().contains("PREEXISTING_SCROLLBACK"),
+            "the prior shell must remain hidden until exit"
+        );
+        assert_ne!(
+            screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "mouse scrolling must be captured by Bund"
+        );
+        assert_eq!(
+            screen.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        assert_eq!(
+            screen.scrollback(),
+            0,
+            "wheel input must not move native shell scrollback"
+        );
+    }
+
+    fn interrupt_once(&mut self) {
+        self.send("\x03");
+        self.wait_visible(EXIT_CONFIRMATION);
+        self.assert_occupied();
+    }
+
+    fn wait_recorded_text(&mut self, dir: &Path, needle: &str) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = bund_store::SqliteStore::open(dir.join("state")).unwrap();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.pump();
+            let found = runtime.block_on(async {
+                let sessions = store.list().await.unwrap();
+                let events = store.events_after(&sessions[0].id, 0, 4096).await.unwrap();
+                events.iter().any(|event| {
+                    // Accept either retained legacy progress or the additive
+                    // response-scoped event without coupling to its Rust shape.
+                    let kind = serde_json::to_value(&event.kind).unwrap();
+                    kind.pointer("/data/text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains(needle))
+                })
+            });
+            if found {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stream delta was not recorded: {needle}"
             );
             thread::sleep(Duration::from_millis(5));
         }
@@ -331,25 +442,37 @@ impl Pty {
             let screen = self.screen.screen();
             let (rows, cols) = screen.size();
             let contents = screen.contents();
-            // A 9-row inline viewport has a 5-row editor plus a 1-row footer.
-            // Check real rendered cells, not an ANSI-stripped byte transcript.
-            let top = rows - 6;
-            let bottom = rows - 2;
+            // Drafts and the three approval choices share a five-row box at the
+            // bottom. Assert emulator cells rather than bytes.
+            let height = 5;
+            let top = rows - height;
+            let bottom = rows - 1;
             let bordered = screen.cell(top, 0).unwrap().contents() == "╭"
                 && screen.cell(bottom, 0).unwrap().contents() == "╰"
-                && screen.cell(bottom, cols - 1).unwrap().contents() == "╯";
+                && screen.cell(bottom, cols - 1).unwrap().contents() == "╯"
+                && screen.cell(bottom, 0).unwrap().fgcolor() == vt100::Color::Idx(6);
             let editor = screen
                 .rows(0, cols)
                 .skip(top as usize)
-                .take(5)
+                .take(height as usize)
                 .collect::<Vec<_>>()
                 .join("\n");
             let draft_visible =
-                draft.is_none_or(|text| text.lines().all(|line| editor.contains(line)));
+                approval || draft.is_none_or(|text| text.lines().all(|line| editor.contains(line)));
             let approval_visible = !approval
-                || (contents.contains("Approval required: apply_patch")
-                    && editor.contains("draft paused"));
-            if bordered && editor.contains("Ask bund") && draft_visible && approval_visible {
+                || (editor.contains("Approval: apply_patch")
+                    && editor.contains("1 Approve once")
+                    && editor.contains("2 Approve for this session")
+                    && editor.contains("3 Tell Bund what to do differently")
+                    && !editor.contains("Deny")
+                    && !editor.contains("4 Tell")
+                    && editor.contains("draft saved"));
+            if screen.alternate_screen()
+                && bordered
+                && (approval || editor.contains("Ask bund"))
+                && draft_visible
+                && approval_visible
+            {
                 return;
             }
             assert!(
@@ -365,12 +488,42 @@ impl Pty {
     }
 
     fn finish(&mut self) {
-        self.send("/exit\r");
-        self.wait_text(0, "BUND_DONE");
+        // Reset any confirmation left by cancellation, then send exactly two
+        // adjacent presses without depending on scheduling within the 1.5s window.
+        self.send("\x1b[C\x03\x03");
+        self.wait_finished();
+    }
+
+    fn wait_finished(&mut self) {
+        self.wait_visible("BUND_DONE");
         assert_eq!(
             self.before,
             tcgetattr(&self.slave).unwrap(),
             "terminal settings must be fully restored"
+        );
+        assert!(
+            !self.screen.screen().alternate_screen(),
+            "exit must restore the primary screen"
+        );
+        assert_eq!(
+            self.screen.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "exit must disable mouse reporting"
+        );
+        assert_eq!(
+            self.screen.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
+        );
+        assert!(
+            self.screen
+                .screen()
+                .contents()
+                .contains("PREEXISTING_SCROLLBACK"),
+            "the original shell contents must return on exit"
+        );
+        assert!(
+            !self.screen.screen().contents().contains("Ask bund"),
+            "fullscreen composer must not remain on the restored shell"
         );
         self.send("done\n");
         let deadline = Instant::now() + WAIT;
@@ -405,41 +558,485 @@ impl Drop for Pty {
 }
 
 #[test]
+fn only_consecutive_interrupts_exit_and_other_input_or_timeout_resets_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut terminal = Pty::spawn(dir.path(), "http://127.0.0.1:1/v1");
+    terminal.wait_composer(None, false);
+    terminal.wait_visible("Latest conversation");
+    terminal.assert_occupied();
+
+    terminal.interrupt_once(); // An empty composer no longer exits on one press.
+    terminal.send("\x04");
+    terminal.wait_visible(EXIT_HELP);
+    terminal.assert_occupied();
+    terminal.send("/exit\r");
+    terminal.wait_composer(Some("/exit"), false);
+    terminal.wait_visible(EXIT_HELP);
+    terminal.assert_occupied();
+    terminal.send(&"\x7f".repeat(5));
+    terminal.wait_visible("Ask bund about this workspace");
+
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.send("!"); // Editing between presses disarms the first press.
+    let edited = format!("{DRAFT}!");
+    terminal.wait_composer(Some(&edited), false);
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+
+    // Await the actual expiry redraw rather than racing a sleep with input.
+    terminal.wait_screen("exit confirmation timeout", |screen| {
+        !screen.contents().contains(EXIT_CONFIRMATION)
+    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+    terminal.wheel(false); // A deliberate scroll also interrupts the sequence.
+    terminal.wait_screen("scroll resets exit confirmation", |screen| {
+        !screen.contents().contains(EXIT_CONFIRMATION)
+    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+    terminal.finish();
+}
+
+#[test]
+fn operating_system_interrupts_require_confirmation_and_restore_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut terminal = Pty::spawn(dir.path(), "http://127.0.0.1:1/v1");
+    terminal.wait_composer(None, false);
+    terminal.wait_visible("Latest conversation");
+    let pid: nix::libc::pid_t = std::fs::read_to_string(dir.path().join("bund.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1 && pid as u32 != terminal.child.id());
+    let interrupt = || assert_eq!(unsafe { nix::libc::kill(pid, nix::libc::SIGINT) }, 0);
+    interrupt();
+    terminal.wait_visible(EXIT_CONFIRMATION);
+    terminal.assert_occupied();
+    terminal.send("preserved after signal");
+    terminal.wait_composer(Some("preserved after signal"), false);
+    interrupt(); // Input interrupted the prior confirmation sequence.
+    terminal.wait_visible(EXIT_CONFIRMATION);
+    terminal.wait_composer(Some("preserved after signal"), false);
+    terminal.assert_occupied();
+    interrupt(); // A second real signal confirms exit, without targeting the wrapper.
+    terminal.wait_finished();
+}
+
+#[test]
+fn first_interrupt_cancels_pending_approval_without_closing_or_losing_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (advance, gate) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("approval-message", "Preparing approval\n");
+        let first = start("approval-response", &item) + &delta("Preparing approval\n");
+        let call = json!({"type":"function_call","id":"approval-call","call_id":"approval-call",
+            "name":"apply_patch","arguments":json!({"path":"created.txt","content":"unapproved"}).to_string(),
+            "status":"completed"});
+        let completed = finish("approval-response", &[item, call]);
+        header(&mut socket, first.len() + completed.len());
+        socket.write_all(first.as_bytes()).unwrap();
+        socket.flush().unwrap();
+        gate.recv_timeout(WAIT).unwrap();
+        socket.write_all(completed.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("prepare an edit\r");
+    terminal.wait_visible("Preparing approval");
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    advance.send(()).unwrap();
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.interrupt_once();
+    terminal.wait_screen("approval cancelled while Bund remains open", |screen| {
+        screen.contents().contains("Cancelled")
+            && !screen.contents().contains("Approval: apply_patch")
+    });
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.assert_occupied();
+    assert!(!dir.path().join("created.txt").exists());
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
+fn session_approval_choice_allows_later_edits_without_another_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("session-approval-message", "Preparing two edits\n");
+        let calls = ["first.txt", "second.txt"].map(|path| {
+            json!({"type":"function_call","id":path,"call_id":path,
+                "name":"apply_patch","arguments":json!({"path":path,"content":format!("created {path}")}).to_string(),
+                "status":"completed"})
+        });
+        let response = start("session-approval-response", &item)
+            + &delta("Preparing two edits\n")
+            + &finish(
+                "session-approval-response",
+                &[item, calls[0].clone(), calls[1].clone()],
+            );
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+        drop(socket);
+        let (mut socket, request) = accept_request(&listener);
+        let results = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .count();
+        assert_eq!(
+            results, 2,
+            "both requested edits must complete after one session grant"
+        );
+        let item = message("session-approval-answer", "Both edits completed\n");
+        let response = start("session-approval-result", &item)
+            + &delta("Both edits completed\n")
+            + &finish("session-approval-result", &[item]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("create two files\r");
+    terminal.wait_composer(None, true);
+    terminal.send("2"); // Approve the edit and subsequent workspace edits for this session.
+    terminal.wait_visible("Both edits completed");
+    terminal.wait_visible("Completed");
+    terminal.wait_composer(None, false);
+    for path in ["first.txt", "second.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(path)).unwrap(),
+            format!("created {path}")
+        );
+    }
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
+fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (advance, gate) = mpsc::channel();
+    let (recorded, requests) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("feedback-message", "Preparing feedback review\n");
+        let first = start("feedback-response", &item) + &delta("Preparing feedback review\n");
+        let call = json!({"type":"function_call","id":"feedback-call","call_id":"feedback-call",
+            "name":"apply_patch","arguments":json!({"path":"created.txt","content":"unapproved"}).to_string(),
+            "status":"completed"});
+        let completed = finish("feedback-response", &[item, call]);
+        header(&mut socket, first.len() + completed.len());
+        socket.write_all(first.as_bytes()).unwrap();
+        socket.flush().unwrap();
+        gate.recv_timeout(WAIT).unwrap();
+        socket.write_all(completed.as_bytes()).unwrap();
+        drop(socket);
+        let (mut socket, request) = accept_request(&listener);
+        recorded.send(request).unwrap();
+        let item = message("feedback-answer", "Guidance acknowledged\n");
+        let response = start("feedback-result", &item)
+            + &delta("Guidance acknowledged\n")
+            + &finish("feedback-result", &[item]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("prepare an edit\r");
+    terminal.wait_visible("Preparing feedback review");
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    advance.send(()).unwrap();
+    terminal.wait_composer(Some(DRAFT), true);
+    let screen = terminal.screen.screen();
+    let (rows, cols) = screen.size();
+    assert!(screen
+        .rows(0, cols)
+        .nth((rows - 4) as usize)
+        .unwrap()
+        .contains("› 1 Approve once"));
+    let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+    let placeholder = third.find(GUIDANCE_PLACEHOLDER).unwrap();
+    let column = unicode_width::UnicodeWidthStr::width(&third[..placeholder]) as u16;
+    assert_eq!(
+        screen.cell(rows - 2, column).unwrap().fgcolor(),
+        vt100::Color::Idx(8)
+    );
+    terminal.send("\x1b[B");
+    terminal.wait_screen("session approval selected with Down", |screen| {
+        let (rows, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .nth((rows - 3) as usize)
+            .unwrap()
+            .contains("› 2 Approve for this session")
+    });
+    terminal.send("\x1b[B");
+    terminal.wait_screen("last approval option focused", |screen| {
+        let (rows, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .nth((rows - 2) as usize)
+            .unwrap()
+            .contains("› 3 ")
+    });
+    let first = "Use option 1: inspect 世界.";
+    terminal.send(first); // Typing works immediately, without Enter or another mode switch.
+    terminal.wait_screen("guidance typed inline", |screen| {
+        let (rows, cols) = screen.size();
+        let choices = screen
+            .rows(0, cols)
+            .skip((rows - 4) as usize)
+            .take(3)
+            .collect::<Vec<_>>();
+        choices[0].contains("1 Approve once")
+            && choices[1].contains("2 Approve for this session")
+            && choices[2].contains(first)
+            && !choices[2].contains(GUIDANCE_PLACEHOLDER)
+    });
+    terminal.send("\x1b[A"); // Up from the first guidance line returns to session approval.
+    terminal.wait_screen(
+        "guidance retained while navigating to session approval",
+        |screen| {
+            let (rows, cols) = screen.size();
+            let choices = screen
+                .rows(0, cols)
+                .skip((rows - 3) as usize)
+                .take(2)
+                .collect::<Vec<_>>();
+            choices[0].contains("› 2 Approve for this session") && choices[1].contains(first)
+        },
+    );
+    terminal.send("\x1b[B");
+    terminal.wait_screen("guidance refocused after Down", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        third.contains("› 3 ") && third.contains(first)
+    });
+    terminal.send("\x1b"); // Esc also leaves the field without discarding its contents.
+    terminal.wait_screen("guidance retained after Escape", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        !third.contains("› 3 ") && third.contains(first)
+    });
+    terminal.send("3"); // The number shortcut focuses the same saved inline field.
+    terminal.wait_screen("guidance refocused by shortcut", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        third.contains("› 3 ") && third.contains(first)
+    });
+    terminal.resize(18, 62);
+    terminal.wait_screen("guidance retained while resizing", |screen| {
+        let (rows, cols) = screen.size();
+        let editor = screen
+            .rows(0, cols)
+            .skip((rows - 5) as usize)
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.contains("1 Approve once")
+            && editor.contains("2 Approve for this session")
+            && editor.contains(first)
+    });
+    let suffix = " Keep the file.";
+    terminal.send(suffix);
+    let guidance = format!("{first}{suffix}");
+    terminal.wait_visible(&guidance);
+    terminal.send("\r");
+    terminal.wait_visible("Guidance acknowledged");
+    terminal.wait_visible("Completed");
+    terminal.wait_composer(Some(DRAFT), false);
+    let next = requests.recv_timeout(WAIT).unwrap();
+    assert!(next["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "function_call_output"
+            && item["output"]
+                .as_str()
+                .is_some_and(|text| text.contains(&guidance))
+    }));
+    assert!(!dir.path().join("created.txt").exists());
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
 fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture();
     let mut terminal = Pty::spawn(dir.path(), &fixture.endpoint);
     terminal.wait_composer(None, false);
-    let mut scrollback = terminal.screen.screen().clone();
-    scrollback.set_scrollback(1000);
+    terminal.assert_occupied();
+    assert!(!terminal
+        .screen
+        .screen()
+        .contents()
+        .contains("PREEXISTING_SCROLLBACK"));
+    let header = terminal
+        .screen
+        .screen()
+        .rows(0, 90)
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(header.contains("fixture-model"), "{header}");
+    assert!(header.contains("Ctrl+O"), "{header}");
+    terminal.send(&format!("\x1b[200~{PROMPT}\x1b[201~\r"));
+    terminal.wait_visible("Streaming ready");
+    terminal.wait_visible("Assistant continuation 🦀");
+    let screen = terminal.screen.screen();
+    let rows: Vec<_> = screen.rows(0, 90).collect();
+    let query_row = rows
+        .iter()
+        .position(|line| line.contains("begin fixture"))
+        .unwrap();
+    let response_row = rows
+        .iter()
+        .position(|line| line.contains("Streaming ready"))
+        .unwrap();
     assert!(
-        scrollback.contents().contains("PREEXISTING_SCROLLBACK"),
-        "launch must preserve existing terminal contents in native scrollback"
+        rows[query_row].starts_with("● begin fixture"),
+        "{}",
+        rows[query_row]
     );
-    terminal.send("begin fixture\r");
-    terminal.wait_text(0, "Streaming ready");
+    assert_eq!(
+        screen.cell(query_row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Rgb(10, 132, 255),
+        "the user dot is blue"
+    );
+    assert!(rows[query_row + 1].starts_with("  query continuation 世界"));
+    assert!(
+        rows[query_row + 2].trim().is_empty(),
+        "a blank line separates the query and answer"
+    );
+    assert_eq!(response_row, query_row + 3);
+    assert!(
+        rows[response_row].starts_with("● Streaming ready 界"),
+        "{}",
+        rows[response_row]
+    );
+    assert_eq!(
+        screen.cell(response_row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Idx(7),
+        "the assistant dot is gray"
+    );
+    assert!(rows[response_row + 1].starts_with("  Assistant continuation 🦀"));
+    assert!(
+        !rows[4..19]
+            .iter()
+            .any(|line| matches!(line.trim(), "You" | "Bund")),
+        "speaker dots replace standalone speaker-label rows"
+    );
     fixture.requests.recv_timeout(WAIT).unwrap();
     terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
-    terminal.wait_text(0, "keep this draft");
     terminal.wait_composer(Some(DRAFT), false);
+    assert!(
+        !String::from_utf8_lossy(&terminal.received).contains("REASONING_ONLY_WHEN_EXPANDED"),
+        "hidden reasoning must never be painted before expansion"
+    );
+    // SGR mouse coordinates are one-based. Drag across the response, including
+    // both cells of its final wide glyph, while the fixture holds the stream.
+    let mouse_row = response_row + 1;
+    terminal.send(&format!("\x1b[<0;3;{mouse_row}M\x1b[<32;20;{mouse_row}M"));
+    let highlight = vt100::Color::Rgb(35, 85, 145);
+    terminal.wait_screen("dragged response highlighted", |screen| {
+        // vt100 stores the wide glyph's style on its leading cell; the
+        // continuation cell deliberately has default attributes.
+        [2, 3, 18]
+            .into_iter()
+            .all(|col| screen.cell(response_row as u16, col).unwrap().bgcolor() == highlight)
+            && screen
+                .cell(response_row as u16, 19)
+                .unwrap()
+                .is_wide_continuation()
+            && screen.cell(response_row as u16, 0).unwrap().bgcolor() != highlight
+            && screen.contents().contains("Streaming ready 界")
+    });
+    terminal.wait_composer(Some(DRAFT), false);
+    // Clear before releasing, so this test never starts a real clipboard helper.
+    terminal.send("\x1b[1;5F");
+    terminal.wait_screen("selection cleared and live following restored", |screen| {
+        screen.cell(response_row as u16, 2).unwrap().bgcolor() != highlight
+            && !screen.contents().contains("Browsing history")
+            && screen.contents().contains("Streaming ready 界")
+    });
+    terminal.send(&format!("\x1b[<0;20;{mouse_row}m"));
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.send("\x0f"); // Ctrl+O expands inline details, preserving the draft.
+    terminal.wait_visible("REASONING_ONLY_WHEN_EXPANDED");
+    let screen = terminal.screen.screen();
+    let (rows, cols) = screen.size();
+    assert!(
+        (4..rows - 5).any(|row| (0..cols).any(|col| {
+            let cell = screen.cell(row, col).unwrap();
+            cell.fgcolor() == ORANGE && matches!(cell.contents(), "╭" | "╰" | "│")
+        })),
+        "expanded activity needs an orange outline in the transcript"
+    );
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.send("\x0f");
+    terminal.wait_screen("collapsed activity", |screen| {
+        let (rows, cols) = screen.size();
+        !screen.contents().contains("REASONING_ONLY_WHEN_EXPANDED")
+            && !(4..rows - 5)
+                .any(|row| (0..cols).any(|col| screen.cell(row, col).unwrap().fgcolor() == ORANGE))
+    });
     terminal.send("\r");
-    terminal.wait_text(0, "is active.");
+    terminal.wait_visible("is active.");
     fixture.advance.send(()).unwrap();
-    terminal.wait_text(0, "visible-safe");
+    terminal.wait_visible("visible-safe");
     fixture.advance.send(()).unwrap();
-    terminal.wait_text(0, "Approval required: apply_patch");
-    terminal.wait_text(0, "Your draft is preserved.");
     terminal.wait_composer(Some(DRAFT), true);
-    let before_resize = terminal.received.len();
+    let review_before = terminal
+        .screen
+        .screen()
+        .rows(0, 90)
+        .skip(4)
+        .take(15)
+        .collect::<Vec<_>>();
+    terminal.send("\x1b[6~"); // PageDown scrolls only the long approval preview.
+    terminal.wait_screen("paged approval preview", |screen| {
+        screen.rows(0, 90).skip(4).take(15).collect::<Vec<_>>() != review_before
+    });
+    terminal.wait_composer(Some(DRAFT), true);
+    let review_before_wheel = terminal
+        .screen
+        .screen()
+        .rows(0, 90)
+        .skip(4)
+        .take(15)
+        .collect::<Vec<_>>();
+    terminal.wheel(false);
+    terminal.wait_screen("mouse wheel scrolls approval preview", |screen| {
+        screen.rows(0, 90).skip(4).take(15).collect::<Vec<_>>() != review_before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.send("\x0f"); // Activity toggle must remain usable during approval.
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.send("\x0f");
     terminal.resize(18, 62);
-    terminal.wait_text(before_resize, "Your draft is preserved.");
     terminal.wait_composer(Some(DRAFT), true);
     terminal.resize(30, 100);
     terminal.wait_composer(Some(DRAFT), true);
-    let before_deny = terminal.received.len();
-    terminal.send("\x0e"); // Ctrl+N denies without touching the composer.
-    terminal.wait_text(before_deny, "Denial acknowledged");
-    terminal.wait_text(before_deny, "Completed");
+    terminal.send("\x0e"); // Ctrl+N denies without feedback and restores the composer.
+    terminal.wait_visible("Denial acknowledged");
+    terminal.wait_visible("Completed");
     let followup = fixture.requests.recv_timeout(WAIT).unwrap();
     assert!(followup["input"].as_array().unwrap().iter().any(|item| {
         item["type"] == "function_call_output"
@@ -450,14 +1047,45 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     }));
     assert!(!dir.path().join("created.txt").exists());
     terminal.send("\r"); // Submit the original, still untouched multiline draft.
-    terminal.wait_text(0, "Cancellation stream is active");
+    terminal.wait_visible("Cancellation stream is active");
     let request = fixture.requests.recv_timeout(WAIT).unwrap();
     assert_eq!(
         request["input"].as_array().unwrap().last().unwrap()["content"],
         DRAFT
     );
-    terminal.send("\x03"); // Cancel an actual unfinished provider stream.
-    terminal.wait_text(0, "Cancelled");
+    terminal.send("\x1b[5~"); // PageUp pauses following streamed output.
+    terminal.wait_visible("Browsing history");
+    let (row, anchor) = terminal
+        .screen
+        .screen()
+        .rows(0, 100)
+        .enumerate()
+        .find(|(_, line)| line.contains("Scroll row"))
+        .expect("paging should expose an older response row");
+    fixture.advance.send(()).unwrap();
+    terminal.wait_recorded_text(dir.path(), LATEST);
+    terminal.send("\x1b[200~still drafting 世界\x1b[201~");
+    terminal.wait_composer(Some("still drafting 世界"), false);
+    assert_eq!(
+        terminal.screen.screen().rows(0, 100).nth(row).unwrap(),
+        anchor,
+        "new streaming output must preserve the scrolled message anchor"
+    );
+    assert!(
+        !terminal.screen.screen().contents().contains(LATEST),
+        "new output must not force the history view back to the bottom"
+    );
+    terminal.send("\x1b[6~");
+    terminal.wait_visible("Browsing history");
+    terminal.send("\x1b[1;5F"); // Ctrl+End resumes following the latest output.
+    terminal.wait_screen("latest output after Ctrl+End", |screen| {
+        screen.contents().contains(LATEST) && !screen.contents().contains("Browsing history")
+    });
+    terminal.wait_composer(Some("still drafting 世界"), false);
+    terminal.interrupt_once(); // Cancel without closing or clearing the draft.
+    terminal.wait_visible("Cancelled");
+    terminal.wait_composer(Some("still drafting 世界"), false);
+    terminal.assert_occupied();
     fixture.advance.send(()).unwrap();
     terminal.finish();
     fixture.worker.join().unwrap();
@@ -476,9 +1104,14 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         "OSC payload must be removed"
     );
     assert!(
-        !raw.contains("\x1b[?1049h"),
-        "native scrollback must remain active"
+        raw.contains("\x1b[?1049h"),
+        "interactive UI must enter the alternate screen"
     );
+    assert!(
+        raw.contains("\x1b[?1049l"),
+        "interactive UI must leave the alternate screen"
+    );
+    assert!(!raw.contains("OPAQUE_REASONING_MUST_STAY_PRIVATE"));
     assert!(!raw.contains("fixture-only-key"));
     let visible = bund_cli::output::clean(&raw);
     assert!(visible.contains("visible-safe"), "{visible}");
@@ -486,7 +1119,7 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     assert!(visible.contains("e\u{301}"));
     assert!(visible.contains('🦀'));
 
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    let session_id = tokio::runtime::Runtime::new().unwrap().block_on(async {
         let store = bund_store::SqliteStore::open(dir.path().join("state")).unwrap();
         let sessions = store.list().await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -508,8 +1141,300 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
             .collect();
         assert_eq!(
             prompts,
-            ["begin fixture", DRAFT],
+            [PROMPT, DRAFT],
             "busy Enter must not enqueue or damage the draft"
         );
+        sessions[0].id.clone()
     });
+
+    // No fixture server remains: expanded history must come entirely from the
+    // durable journal, without a provider call or opaque continuation display.
+    let mut resumed = Pty::spawn_session(dir.path(), &fixture.endpoint, Some(&session_id));
+    resumed.wait_composer(None, false);
+    // The composer is available while history loads in the background. Paging
+    // begins only after the saved transcript is ready, rather than racing it.
+    resumed.wait_visible("Latest conversation");
+    assert!(!String::from_utf8_lossy(&resumed.received).contains("REASONING_ONLY_WHEN_EXPANDED"));
+    resumed.send("\x0f");
+    resumed.send(&"\x1b[5~".repeat(20));
+    resumed.wait_visible("REASONING_ONLY_WHEN_EXPANDED");
+    resumed.wait_composer(None, false);
+    assert!(
+        !String::from_utf8_lossy(&resumed.received).contains("OPAQUE_REASONING_MUST_STAY_PRIVATE")
+    );
+    resumed.send("\x0f\x1b[1;5F");
+    resumed.wait_screen("resumed compact conversation", |screen| {
+        !screen.contents().contains("REASONING_ONLY_WHEN_EXPANDED")
+            && !screen.contents().contains("Browsing history")
+    });
+    resumed.finish();
+}
+
+#[test]
+fn saved_conversation_pages_across_windows_without_skipping_turns() {
+    use bund_core::{
+        Engine, EngineDependencies, Message, ModelProfile, ResponsePurpose, Role, SessionEvent,
+        SessionOptions, ValidationStatus,
+    };
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let store = Arc::new(bund_store::SqliteStore::open(dir.path().join("state")).unwrap());
+        let engine = Engine::new(EngineDependencies {
+            providers: vec![],
+            tools: vec![],
+            store: store.clone(),
+        })
+        .unwrap();
+        let session = engine
+            .create_session(SessionOptions::new(
+                dir.path().to_owned(),
+                ModelProfile::new("openai", "fixture-model"),
+            ))
+            .await
+            .unwrap();
+        let id = session.snapshot().await.unwrap().id;
+        let mut stored = store.load(&id).await.unwrap();
+        let mut events = Vec::new();
+        // Three windows at the CLI's 32-run limit. Batch one valid journal
+        // transaction; no model, credential lookup, or tool execution is needed.
+        for index in 0..70 {
+            let prompt = format!("Saved prompt {index:02}");
+            let answer = format!("Saved answer {index:02}");
+            let response_id = format!("response-{index}");
+            let kinds = [
+                EventKind::RunStarted {
+                    prompt: prompt.clone(),
+                },
+                EventKind::ResponseStarted {
+                    id: response_id.clone(),
+                    purpose: ResponsePurpose::Conversation,
+                },
+                EventKind::ResponseCompleted {
+                    id: response_id.clone(),
+                    purpose: ResponsePurpose::Conversation,
+                    text: answer.clone(),
+                    reasoning: vec![format!("Saved reasoning {index:02}")],
+                    tool_calls: vec![],
+                },
+                EventKind::RunOutput {
+                    response_id: Some(response_id),
+                    text: answer.clone(),
+                },
+                EventKind::RunFinished {
+                    status: RunStatus::Completed,
+                    message: String::new(),
+                    validation: ValidationStatus::NotRun,
+                },
+            ];
+            for kind in kinds {
+                stored.cursor += 1;
+                events.push(SessionEvent {
+                    version: 1,
+                    session_id: id.clone(),
+                    sequence: stored.cursor,
+                    run_id: Some(format!("run-{index}")),
+                    kind,
+                });
+            }
+            stored.messages.push(Message::text(Role::User, prompt));
+            stored.messages.push(Message::text(Role::Assistant, answer));
+        }
+        stored.status = RunStatus::Completed;
+        stored.run_id = None;
+        store.commit(&stored, &events).await.unwrap();
+        id
+    });
+
+    // There is intentionally no listener at this endpoint. Navigation only
+    // reads saved session data, with Keychain access disabled by the harness.
+    let mut terminal = Pty::spawn_session(dir.path(), "http://127.0.0.1:1/v1", Some(&session_id));
+    terminal.wait_composer(None, false);
+    terminal.wait_visible("Latest conversation");
+    terminal.wait_visible("Saved answer 69");
+    terminal.send("\x1b[200~draft survives history paging\x1b[201~");
+    terminal.wait_composer(Some("draft survives history paging"), false);
+
+    fn answers(screen: &vt100::Screen) -> BTreeSet<usize> {
+        screen
+            .contents()
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("● ")
+                    .unwrap_or(line.trim())
+                    .strip_prefix("Saved answer ")
+                    .and_then(|index| index.parse().ok())
+            })
+            .collect()
+    }
+    fn body(screen: &vt100::Screen) -> Vec<String> {
+        let (rows, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .skip(4)
+            .take(rows.saturating_sub(9) as usize)
+            .collect()
+    }
+    fn visit(terminal: &mut Pty, key: &str, target: usize) -> BTreeSet<usize> {
+        let deadline = Instant::now() + WAIT;
+        let mut seen = answers(terminal.screen.screen());
+        while !seen.contains(&target) {
+            assert!(
+                Instant::now() < deadline,
+                "history paging did not reach {target}: {seen:?}"
+            );
+            let before = body(terminal.screen.screen());
+            terminal.send(key);
+            terminal.wait_screen("adjacent saved-history page", |screen| {
+                let text = screen.contents();
+                !text.contains("Loading history")
+                    && !text.contains("History is loading")
+                    && body(screen) != before
+            });
+            seen.extend(answers(terminal.screen.screen()));
+        }
+        seen
+    }
+
+    let before_wheel = body(terminal.screen.screen());
+    terminal.wheel(false);
+    terminal.wait_screen("mouse wheel scrolls Bund history", |screen| {
+        screen.contents().contains("Browsing history") && body(screen) != before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.wait_composer(Some("draft survives history paging"), false);
+    let before_wheel = body(terminal.screen.screen());
+    terminal.wheel(true);
+    terminal.wait_screen("mouse wheel scrolls forward", |screen| {
+        body(screen) != before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.send("\x1b[1;5F");
+    terminal.wait_screen("latest after mouse wheel", |screen| {
+        screen.contents().contains("Saved answer 69")
+            && screen.contents().contains("Latest conversation")
+            && !screen.contents().contains("Browsing history")
+    });
+
+    let expected: BTreeSet<_> = (0..70).collect();
+    assert_eq!(
+        visit(&mut terminal, "\x1b[5~", 0),
+        expected,
+        "paging backward must expose every saved answer"
+    );
+    assert_eq!(
+        visit(&mut terminal, "\x1b[6~", 69),
+        expected,
+        "paging forward must not skip the first run of an adjacent window"
+    );
+    terminal.wait_composer(Some("draft survives history paging"), false);
+    terminal.send("\x1b[1;5F");
+    terminal.wait_screen("latest saved conversation", |screen| {
+        screen.contents().contains("Saved answer 69")
+            && screen.contents().contains("Latest conversation")
+            && !screen.contents().contains("Browsing history")
+    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some("draft survives history paging"), false);
+    terminal.finish();
+}
+
+#[test]
+fn idle_width_changes_repaint_both_right_borders_after_rapid_resize_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let text = format!(
+            "{}ANSWER_END",
+            "Readable 世界 e\u{301} 🦀 response. ".repeat(4)
+        );
+        let item = message("resize-message", &text);
+        let reasoning = json!({"type":"reasoning","id":"resize-reasoning",
+            "summary":[{"type":"summary_text","text":format!("{}REASONING_END", "Inspect Unicode 世界 safely. ".repeat(3))}]});
+        let response = start("resize-response", &item)
+            + &delta(&text)
+            + &finish("resize-response", &[item, reasoning]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("show resize fixture\r");
+    terminal.wait_visible("Completed");
+    terminal.send("\x0f");
+    terminal.wait_visible("REASONING_END");
+    worker.join().unwrap();
+    let draft = format!(
+        "{}FIRST_END\n{}LAST_END",
+        "Draft 世界 ".repeat(7),
+        "Second e\u{301} 🦀 ".repeat(6)
+    );
+    terminal.send(&format!("\x1b[200~{draft}\x1b[201~"));
+
+    fn right_borders(screen: &vt100::Screen) -> bool {
+        let (rows, cols) = screen.size();
+        let composer = rows - 5;
+        if screen.cell(composer, cols - 1).unwrap().contents() != "╮"
+            || screen.cell(rows - 1, cols - 1).unwrap().contents() != "╯"
+            || !(composer + 1..rows - 1)
+                .all(|row| screen.cell(row, cols - 1).unwrap().contents() == "│")
+        {
+            return false;
+        }
+        let mut activity_rows = 0;
+        for row in 4..composer {
+            let left = screen.cell(row, 0).unwrap();
+            if left.fgcolor() != ORANGE {
+                continue;
+            }
+            let expected = match left.contents() {
+                "╭" => "╮",
+                "╰" => "╯",
+                "│" => "│",
+                _ => continue,
+            };
+            let right = screen.cell(row, cols - 1).unwrap();
+            if right.contents() != expected || right.fgcolor() != ORANGE {
+                return false;
+            }
+            activity_rows += 1;
+        }
+        activity_rows >= 3
+    }
+
+    terminal.resize(24, 120);
+    terminal.wait_screen("wide interface right edges", right_borders);
+    terminal.wait_composer(Some(&draft), false);
+    for cols in [43, 101, 57, 120] {
+        terminal.resize(24, cols);
+        terminal.wait_screen("idle width-only resize updates right edges", right_borders);
+        terminal.wait_visible("LAST_END");
+        terminal.assert_occupied();
+    }
+    terminal.wait_composer(Some(&draft), false);
+
+    // A drag can shrink and return to the same final width before the next UI
+    // frame. The terminal has still discarded the old right-hand cells, even
+    // when the renderer's cached dimensions match the final physical winsize.
+    for cols in [47, 32, 65, 38] {
+        let before = terminal.screen.screen().contents();
+        terminal.resize(24, cols);
+        terminal.resize(24, 120);
+        terminal.wait_screen(
+            "same-width resize round trip repaints lost cells",
+            right_borders,
+        );
+        terminal.wait_composer(Some(&draft), false);
+        assert_eq!(
+            terminal.screen.screen().contents(),
+            before,
+            "an idle resize round trip must restore all header, transcript, and draft cells"
+        );
+    }
+    terminal.finish();
 }

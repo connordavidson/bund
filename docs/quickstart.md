@@ -79,14 +79,47 @@ For a Rust project, start with a validation command:
 bund --check 'cargo test'
 ```
 
-Ask for a small change. Enter submits; Ctrl+J adds a newline. The bottom textbox
-keeps your draft visible during streaming and approvals. Ctrl+Y approves the
-displayed action once; Ctrl+N or Esc denies it. Ctrl+C cancels active work.
-Completed edits remain after cancellation.
+Ask for a small change. The fullscreen interface keeps workspace and status
+information at the top and a cyan query box at the bottom. Enter submits;
+Ctrl+J adds a newline. Your draft remains visible during streaming. Approval
+choices appear inside the query box: **1 Approve once**, **2 Approve for this
+session**, and **3 Tell Bund what to do differently**. Use Up/Down and Enter,
+or press a choice's number.
+The last choice is a gray placeholder you can type into as soon as you arrow
+down to it or press 3. Enter in the input declines the proposed action and sends
+your guidance to Bund. Up from its first line or Esc returns to the choices
+without losing what you typed. Your original
+draft is preserved and returns after the decision or cancellation.
+Ctrl+N or Esc from the choices denies without feedback.
+The first Ctrl+C cancels active work and keeps your draft. Completed edits
+remain after cancellation.
 
-When idle, use `/diff` to review changes, `/check` to run configured checks, and
-`/exit` to leave. Checks use the same command approval flow. Completed output
-remains in terminal scrollback.
+**Approve for this session** allows later workspace edits when approving an
+edit, or repeats of that exact command in that same working directory when
+approving a command. Other commands and directories still require approval.
+The grant stays with this saved session ID, including after resume; it does not
+apply to new sessions. Plan mode still blocks edits and shell commands.
+
+Blue dots mark your queries and gray dots mark Bund's responses. A blank line
+separates them, and continuation lines align with the message text.
+
+Ctrl+O expands orange activity boxes beneath responses, including tools and
+provider-supplied reasoning summaries; press it again to collapse them.
+Drag across response text to highlight it, then release the mouse to copy the
+selection to your clipboard. Copying preserves the displayed line breaks and
+omits the speaker dot. Scrolling or typing clears the highlight; Ctrl+End returns
+to the latest output. On Linux, install `wl-copy` (Wayland), `xclip`, or `xsel` (X11).
+The mouse wheel and PageUp/PageDown scroll Bund's conversation without following
+new output, and Ctrl+End returns to the latest output. During approvals, they
+scroll the review preview while the choices and inline guidance stay inside the
+query box.
+
+When idle, use `/diff` to review changes and `/check` to run configured checks.
+Checks use the same command approval flow. To exit, press **Ctrl+C twice
+consecutively within 1.5 seconds**. Any other input or the timeout resets the
+confirmation; Ctrl+D and `/exit` only show this shortcut. Exiting restores your
+previous terminal screen and normal mouse behavior. Reopen saved conversations
+with:
 
 ```sh
 bund sessions

@@ -1,12 +1,12 @@
 # Architecture and extension contract
 
 Bund owns its agent loop. Vendor SDKs or other coding agents do not execute
-workspace tools on its behalf. The initial client is an inline terminal, but
+workspace tools on its behalf. The initial client is a fullscreen terminal, but
 authorization, state transitions, persistence, and provider access are reusable
 Rust library behavior.
 
 ```text
-bund-cli (inline UI / headless)
+bund-cli (fullscreen UI / headless)
           |
           v
 bund-core (Engine, SessionHandle, commands, snapshots, events)
@@ -34,6 +34,15 @@ exclude opaque provider continuation bytes. Clients submit `answer_approval`
 or `cancel`; they never implement their own authorization decisions inside
 the execution path.
 
+`Transcript` reduces ordered events into bounded, terminal-independent runs,
+responses, and tool activity. `TranscriptLimits` controls the retained window;
+clients can replay other windows through `events_after`. Response lifecycle
+events identify conversation versus compaction calls, reconcile provisional
+text with authoritative completion, and retain visible reasoning separately
+from opaque continuation. `RunOutput` identifies the answer or explicitly
+requested local tool result; `RunFinished` supplies its completion and validation
+status. Existing saved event records remain readable.
+
 Use `Provider` for a statically linked vendor adapter, `Tool` for a local tool,
 `CommandExecutor` for another execution environment, and `SessionStore` for
 another persistence implementation. Extensions are trusted Rust code. These
@@ -52,6 +61,13 @@ Tools execute only after a complete provider response has passed validation.
 Approvals bind to normalized operations and observed preconditions. All writes
 and commands are checked again at dispatch, including calls invented by a model
 that were not advertised in Plan mode.
+
+Approving for the session persists a scoped grant in that session's policy.
+Workspace edits enable `accept_edits`; command grants bind the exact command
+string and normalized working directory. The engine validates the pending operation
+again before recording a grant and dispatching it. Resume restores those grants
+only for the same session ID; a new session receives its own policy. These
+grants do not bypass Plan mode or change user configuration.
 
 SQLite uses WAL and full synchronous commits. Snapshot changes and ordered
 events commit together before publication; a started event commits before any
@@ -92,11 +108,47 @@ stops instead of silently dropping required context.
 
 ## Terminal boundary
 
-One Crossterm event source and Ratatui inline renderer own the terminal. No
-alternate screen is entered. Complete output enters native scrollback; only
-the working region is redrawn. The composer survives streaming and approval
-requests. Model and process output is sanitized before display. Headless output
-uses the same engine without terminal initialization.
+One Crossterm event source and one fullscreen Ratatui renderer own the terminal.
+The interactive client enters the alternate screen, captures mouse input for
+its own history navigation, and restores the original screen, mouse handling,
+and terminal modes on exit. Workspace, model, status, and keyboard hints
+stay at the top; the query box stays at the bottom. During approval, numbered
+choices replace the composer contents: 1 approves once, 2 approves for this
+session, and 3 is an inline field with a gray Tell Bund what to do differently
+placeholder. Both the pending and ordinary composer have five rows at normal
+terminal sizes. Up/Down selects choices; moving down to the field
+immediately accepts typing. Its editor is separate from the original draft,
+cursor, and selection. Enter confirms a selected action; choosing 3 focuses
+the final field, and Enter there sends
+guidance as a denied tool result for the next model request. Up from the field's
+first line or Esc returns to the session-approval choice while
+retaining guidance. Ctrl+N or Esc from the choices still denies without feedback.
+A scrollable review preview remains between the header and query box. The composer survives
+streaming, expansion, resize, and approval requests. Interactive exit
+requires two consecutive Ctrl+C presses within 1.5 seconds. The first cancels
+active work while retaining the draft; other input or expiry resets the
+confirmation. Ctrl+D and `/exit` display the exit shortcut. This does not change
+headless cancellation.
+
+Resize handling samples the terminal dimensions while idle and invalidates the
+screen on every resize notification, including rapid shrink/grow cycles that end
+at the previous size. One repaint after resizing settles repairs any frame drawn
+during the drag without continually repainting an idle terminal.
+
+The conversation is retained application state, not text appended to native
+scrollback. Ordered session events reconstruct response text, tool activity,
+and provider-supplied reasoning summaries on resume. Completed responses
+reconcile streamed progress in place. Ctrl+O changes the same transcript's
+layout, revealing orange activity boxes beneath their responses; a stable
+message anchor preserves the reader's position. The mouse wheel and
+PageUp/PageDown stop following new output, and Ctrl+End resumes following.
+Pending approvals take priority over ordinary transcript scrolling.
+
+Model and process output is sanitized before display. Opaque provider
+continuation, signatures, and encrypted reasoning remain outside the visible
+transcript. Models may omit reasoning summaries; the client does not generate
+its own. Headless output uses the same engine without terminal initialization
+and retains its existing text and JSONL behavior.
 
 ## Trust and limits
 

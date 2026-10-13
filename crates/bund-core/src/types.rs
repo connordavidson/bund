@@ -223,6 +223,9 @@ pub enum ProviderEvent {
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub text: String,
+    /// Authoritative provider-visible summaries, never hidden reasoning or
+    /// opaque continuation payloads. Replaces display-only streamed fragments.
+    pub reasoning: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub continuation: Option<Continuation>,
     pub usage: Usage,
@@ -338,6 +341,23 @@ pub struct Policy {
     pub accept_edits: bool,
     /// Full exact command strings, never prefixes or model-supplied grants.
     pub allowed_commands: Vec<String>,
+    /// Exact command and normalized workspace-relative directory grants saved
+    /// only for this session. These never authorize prefixes or other sessions.
+    #[serde(default)]
+    pub session_commands: Vec<CommandGrant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandGrant {
+    pub command: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionApprovalScope {
+    WorkspaceEdits,
+    Command { command: String, cwd: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +388,20 @@ pub struct ApprovalRequest {
     pub preview: String,
     pub fingerprint: String,
     pub workspace: PathBuf,
+    #[serde(default)]
+    pub session_scope: Option<SessionApprovalScope>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Maximum UTF-8 byte length of user guidance attached to a denied approval.
+pub const MAX_APPROVAL_FEEDBACK_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     ApproveOnce,
+    ApproveSession,
     Deny,
+    DenyWithFeedback { feedback: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -404,11 +431,43 @@ pub enum ValidationStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsePurpose {
+    Conversation,
+    Compaction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
     RunStarted {
         prompt: String,
+    },
+    ResponseStarted {
+        id: String,
+        purpose: ResponsePurpose,
+    },
+    ResponseTextDelta {
+        id: String,
+        text: String,
+    },
+    ResponseReasoningDelta {
+        id: String,
+        text: String,
+    },
+    ResponseCompleted {
+        id: String,
+        purpose: ResponsePurpose,
+        text: String,
+        reasoning: Vec<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    /// The final authoritative user-facing output. RunFinished still reports
+    /// failure if validation failed. A local operation has no response ID.
+    RunOutput {
+        response_id: Option<String>,
+        text: String,
     },
     TextDelta {
         text: String,

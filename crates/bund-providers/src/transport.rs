@@ -43,7 +43,7 @@ impl Transport {
         &self,
         base: &str,
         wire: WireProtocol,
-        body: Value,
+        mut body: Value,
         events: &mpsc::Sender<ProviderEvent>,
         cancel: &CancellationToken,
         mut consume: impl FnMut(&str, &str) -> Result<()> + Send,
@@ -95,8 +95,9 @@ impl Transport {
         }
         // The outer deadline includes backoff, response headers, and stream reads.
         let operation = async {
-            let mut response = None;
-            for attempt in 0..=MAX_RETRIES {
+            let mut attempt = 0;
+            let mut summary_fallback_used = false;
+            let response = loop {
                 let sent = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -128,6 +129,16 @@ impl Transport {
                                 _ => break,
                             }
                         }
+                        // Compatibility retry is allowed only for an explicit
+                        // HTTP rejection of the optional summary display field,
+                        // before any successful stream has started. Preserve all
+                        // reasoning effort, model, tool, and history settings.
+                        if !summary_fallback_used
+                            && omit_unsupported_summary(status, &bytes, &wire, &mut body)
+                        {
+                            summary_fallback_used = true;
+                            continue;
+                        }
                         let (kind, message) = classify(status, &bytes);
                         let retryable = matches!(
                             kind,
@@ -138,16 +149,17 @@ impl Transport {
                             && retry_after.is_none_or(|wait| wait <= MAX_RETRY_WAIT)
                         {
                             self.backoff(attempt, retry_after, events, cancel).await?;
+                            attempt += 1;
                             continue;
                         }
                         return Err(failure(kind, self.redact(&message)));
                     }
                     Ok(received) => {
-                        response = Some(received);
-                        break;
+                        break received;
                     }
                     Err(_) if attempt < MAX_RETRIES => {
                         self.backoff(attempt, None, events, cancel).await?;
+                        attempt += 1;
                     }
                     Err(_) => {
                         return Err(failure(
@@ -156,8 +168,7 @@ impl Transport {
                         ))
                     }
                 }
-            }
-            let response = response.ok_or_else(|| protocol("request did not return a response"))?;
+            };
             if !response
                 .headers()
                 .get(CONTENT_TYPE)
@@ -248,6 +259,76 @@ impl Transport {
     }
 }
 
+/// Recognize only explicit provider complaints about the exact optional field.
+/// Missing/ambiguous error metadata must fail normally instead of changing the
+/// user's request. This never applies to errors inside an accepted SSE stream.
+fn omit_unsupported_summary(
+    status: u16,
+    bytes: &[u8],
+    wire: &WireProtocol,
+    body: &mut Value,
+) -> bool {
+    if status != 400 {
+        return false;
+    }
+    if !matches!(
+        classify(status, bytes).0,
+        ProviderErrorKind::Protocol | ProviderErrorKind::Unsupported
+    ) {
+        return false;
+    }
+    let (parent, field, expected) = match wire {
+        WireProtocol::OpenAi => ("reasoning", "summary", "auto"),
+        WireProtocol::Anthropic => ("thinking", "display", "summarized"),
+    };
+    if body[parent][field].as_str() != Some(expected) {
+        return false;
+    }
+    let parsed: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
+    let error = &parsed["error"];
+    let path = format!("{parent}.{field}");
+    let message = error["message"].as_str().unwrap_or("").to_ascii_lowercase();
+    let targets_field = match error.get("param").filter(|value| !value.is_null()) {
+        Some(parameter) => parameter.as_str() == Some(&path),
+        None => {
+            message.starts_with(&format!("{path}:"))
+                || message.starts_with(&format!("{path} is not supported"))
+                || message.starts_with(&format!("{path} is unsupported"))
+                || [
+                    "unsupported parameter",
+                    "unknown parameter",
+                    "unrecognized parameter",
+                    "unsupported value",
+                ]
+                .iter()
+                .any(|prefix| {
+                    message.starts_with(&format!("{prefix}: '{path}'"))
+                        || message.starts_with(&format!("{prefix}: \"{path}\""))
+                })
+        }
+    };
+    let explicitly_unsupported = matches!(
+        error["code"].as_str(),
+        Some("unsupported_parameter" | "unsupported_value")
+    ) || [
+        "not supported",
+        "unsupported",
+        "not permitted",
+        "unknown parameter",
+        "unrecognized parameter",
+        "unrecognized field",
+        "unknown field",
+        "extra inputs",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
+    if !targets_field || !explicitly_unsupported {
+        return false;
+    }
+    body[parent].as_object_mut().unwrap().remove(field);
+    true
+}
+
 fn parse_retry_after(value: &str) -> Option<Duration> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -319,6 +400,77 @@ pub(crate) fn stream_error(value: &Value) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn compatibility_retry_requires_an_explicit_exact_optional_field_rejection() {
+        for (wire, body, error, expected) in [
+            (
+                WireProtocol::OpenAi,
+                json!({"model":"gpt-5-nano", "reasoning":{"effort":"minimal", "summary":"auto"}}),
+                json!({"error":{"param":"reasoning.summary", "code":"unsupported_value", "message":"Unsupported value: auto is not supported with this model"}}),
+                json!({"model":"gpt-5-nano", "reasoning":{"effort":"minimal"}}),
+            ),
+            (
+                WireProtocol::OpenAi,
+                json!({"reasoning":{"effort":"low", "summary":"auto"}}),
+                json!({"error":{"message":"Unsupported parameter: 'reasoning.summary' is not supported with this model."}}),
+                json!({"reasoning":{"effort":"low"}}),
+            ),
+            (
+                WireProtocol::Anthropic,
+                json!({"thinking":{"type":"adaptive", "display":"summarized"}, "output_config":{"effort":"low"}}),
+                json!({"error":{"type":"invalid_request_error", "message":"thinking.display: Extra inputs are not permitted"}}),
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":"low"}}),
+            ),
+        ] {
+            let mut body = body;
+            let bytes = serde_json::to_vec(&error).unwrap();
+            assert!(omit_unsupported_summary(400, &bytes, &wire, &mut body));
+            assert_eq!(body, expected);
+            assert!(!omit_unsupported_summary(400, &bytes, &wire, &mut body));
+        }
+        let original = json!({"reasoning":{"effort":"minimal", "summary":"auto"}});
+        for (status, error) in [
+            (
+                400,
+                json!({"error":{"param":"reasoning.effort", "code":"unsupported_value", "message":"Unsupported effort when reasoning.summary is enabled"}}),
+            ),
+            (
+                400,
+                json!({"error":{"param":"reasoning.summary", "message":"invalid request"}}),
+            ),
+            (
+                400,
+                json!({"error":{"message":"reasoning.summary is present, but reasoning.effort is unsupported"}}),
+            ),
+            (
+                400,
+                json!({"error":{"param":"reasoning.summary", "type":"authentication_error", "message":"unsupported"}}),
+            ),
+            (
+                401,
+                json!({"error":{"param":"reasoning.summary", "code":"unsupported_parameter"}}),
+            ),
+            (
+                429,
+                json!({"error":{"param":"reasoning.summary", "code":"unsupported_parameter"}}),
+            ),
+            (
+                500,
+                json!({"error":{"param":"reasoning.summary", "code":"unsupported_parameter"}}),
+            ),
+        ] {
+            let mut body = original.clone();
+            assert!(!omit_unsupported_summary(
+                status,
+                &serde_json::to_vec(&error).unwrap(),
+                &WireProtocol::OpenAi,
+                &mut body
+            ));
+            assert_eq!(body, original);
+        }
+    }
     #[test]
     fn quota_is_not_transient() {
         assert_eq!(

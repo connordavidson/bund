@@ -1,35 +1,42 @@
 use crate::{
     config::{require_model, update_profile},
-    output::{clean, FinalText, Sanitizer, StreamedText},
+    output::clean,
 };
 use anyhow::{Context, Result};
 use bund_core::{
-    ApprovalDecision, ApprovalRequest, EventKind, Mode, Policy, Role, RunStatus, SessionEvent,
-    SessionHandle, SessionSnapshot,
+    ApprovalDecision, ApprovalRequest, EventKind, Mode, Policy, RunStatus, SessionEvent,
+    SessionHandle, SessionSnapshot, Transcript,
 };
 use crossterm::{
-    cursor::MoveTo,
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
 };
 use ratatui::{
-    backend::Backend,
     layout::Rect,
-    style::{Color, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
-    Frame, Terminal, TerminalOptions, Viewport,
+    Frame,
 };
 use ratatui_textarea::TextArea;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+#[path = "ui_clipboard.rs"]
+mod clipboard;
+#[path = "ui_render.rs"]
+mod render;
+#[path = "ui_selection.rs"]
+mod selection;
+use render::{Anchor, Document};
+use selection::{SelectionRow, SelectionView};
 
 const COMMANDS: &[&str] = &[
     "/help",
@@ -42,24 +49,331 @@ const COMMANDS: &[&str] = &[
     "/check",
     "/skill",
     "/accept-edits",
-    "/exit",
 ];
-const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off /exit\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc or Ctrl+C cancels work. Approval: Ctrl+Y approves once; Ctrl+N or Esc denies.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
+const EXIT_WINDOW: Duration = Duration::from_millis(1500);
+const EXIT_CONFIRM: &str = "Press Ctrl+C again to exit";
+const EXIT_INSTRUCTION: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
+const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Up/Down chooses; Enter confirms. Arrow down to the gray Tell Bund what to do field and type guidance; Enter sends it. Up from its first line or Esc returns to choices without losing guidance. 1 approves once; 2 approves for this session; 3 focuses Tell Bund what to do differently. Enter sends guidance and skips the proposed action. Session approval covers workspace edits or only the exact command in its directory. Ctrl+Y/Ctrl+N still approve/deny from the choices.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
 
-/// All mutable screen state lives here; approval controls never borrow the draft buffer.
+/// One state owner keeps drafts independent from streaming and approval controls.
 struct Screen {
     editor: TextArea<'static>,
+    approval_feedback: Option<TextArea<'static>>,
+    approval_selected: ApprovalChoice,
     snapshot: SessionSnapshot,
     pending: Option<ApprovalRequest>,
-    tail: String,
-    sanitizer: Sanitizer,
-    streamed: StreamedText,
-    output_calls: HashSet<String>,
+    transcript: Transcript,
+    expanded: bool,
+    follow: bool,
+    anchor: Option<Anchor>,
+    document: Document,
+    document_dirty: bool,
+    document_width: u16,
+    selection: SelectionView,
+    clipboard_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    viewport_height: usize,
+    top: usize,
+    approval_scroll: usize,
+    history_ceiling: Option<u64>,
+    history_task: Option<tokio::task::JoinHandle<Result<HistoryLoad>>>,
+    history_follow_pending: bool,
+    exit_armed_at: Option<Instant>,
     hint: String,
+    notices: VecDeque<String>,
     history: History,
 }
 
+#[derive(Clone, Copy)]
+enum HistoryTarget {
+    Top,
+    Bottom,
+    Latest,
+}
+
+struct HistoryLoad {
+    transcript: Transcript,
+    ceiling: u64,
+    target: HistoryTarget,
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        if let Some(task) = self.history_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.clipboard_task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl Screen {
+    fn reset_exit_confirmation(&mut self) {
+        self.exit_armed_at = None;
+    }
+
+    fn expire_exit_confirmation(&mut self) -> bool {
+        if self
+            .exit_armed_at
+            .is_some_and(|at| at.elapsed() > EXIT_WINDOW)
+        {
+            self.reset_exit_confirmation();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn confirm_exit_at(&mut self, now: Instant) -> bool {
+        let confirmed = self
+            .exit_armed_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= EXIT_WINDOW);
+        self.exit_armed_at = if confirmed { None } else { Some(now) };
+        confirmed
+    }
+
+    fn display_hint(&self) -> &str {
+        if self
+            .exit_armed_at
+            .is_some_and(|at| at.elapsed() <= EXIT_WINDOW)
+        {
+            EXIT_CONFIRM
+        } else {
+            &self.hint
+        }
+    }
+
+    fn build_document(&self, width: usize) -> Document {
+        use bund_core::{ResponsePurpose, TranscriptToolStatus};
+        let mut document = Document::default();
+        if width < 4 {
+            return document;
+        }
+        if self.transcript.runs().is_empty() {
+            document.section("welcome", "welcome", render::markdown("Ask Bund to inspect or change this workspace.\n/help lists commands. Edits and shell commands require approval.", width));
+        }
+        for run in self.transcript.runs() {
+            let message_width = width - 2;
+            let mut prompt = render::plain(&run.prompt, message_width, Style::default());
+            prompt.push(Line::default());
+            document.message_section(&run.id, "prompt", prompt, render::QUERY_BLUE);
+
+            let latest = run
+                .responses
+                .iter()
+                .rev()
+                .find(|r| r.purpose == ResponsePurpose::Conversation);
+            let text = run
+                .output
+                .as_deref()
+                .or_else(|| {
+                    latest
+                        .filter(|r| {
+                            !r.complete || (run.status.is_active() && r.tool_calls.is_empty())
+                        })
+                        .map(|r| r.text.as_str())
+                })
+                .unwrap_or("");
+            let mut answer = Vec::new();
+            if !text.is_empty() {
+                answer.extend(render::markdown(text, message_width));
+            } else if run.status.is_active() {
+                answer.extend(render::plain(
+                    "Working…",
+                    message_width,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if latest.is_some_and(|r| !r.complete) && !run.status.is_active() {
+                answer.extend(render::plain(
+                    "Incomplete response",
+                    message_width,
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            document.message_section(&run.id, "answer", answer, Color::Gray);
+
+            let activity = format!("Activity · {} tools", run.tools.len());
+            if self.expanded {
+                let inner = width.saturating_sub(4).max(1);
+                let mut border = render::bordered(&activity, Vec::new(), width);
+                let footer = border.pop().unwrap();
+                document.section(&run.id, "activity", border);
+                // Merge response rounds and executions by their journal position.
+                let mut items = run
+                    .responses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.start_sequence, true, i))
+                    .chain(
+                        run.tools
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| (t.start_sequence, false, i)),
+                    )
+                    .collect::<Vec<_>>();
+                items.sort_by_key(|item| item.0);
+                if run.responses.iter().all(|r| r.reasoning.is_empty()) {
+                    let mut body = render::plain(
+                        "No reasoning summary provided",
+                        inner,
+                        Style::default().fg(Color::DarkGray),
+                    );
+                    body.push(Line::default());
+                    document.section(
+                        &run.id,
+                        "reasoning-unavailable",
+                        render::bordered_body(body, width),
+                    );
+                }
+                for (_, response, index) in items {
+                    let mut body = Vec::new();
+                    let section;
+                    if response {
+                        let r = &run.responses[index];
+                        section = format!("response-{}", r.id);
+                        if r.purpose == ResponsePurpose::Compaction {
+                            body.extend(render::plain(
+                                if r.complete {
+                                    "Context compacted"
+                                } else {
+                                    "Compacting context…"
+                                },
+                                inner,
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                            document.section(&run.id, &section, render::bordered_body(body, width));
+                            continue;
+                        }
+                        if !r.reasoning.is_empty() {
+                            body.extend(render::plain(
+                                if r.complete {
+                                    "Reasoning summary"
+                                } else {
+                                    "Reasoning summary · partial"
+                                },
+                                inner,
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ));
+                            for text in &r.reasoning {
+                                body.extend(render::markdown(text, inner));
+                            }
+                        }
+                        if !r.is_final && !r.text.is_empty() && r.text != text {
+                            body.extend(render::plain(
+                                if r.complete {
+                                    "Update"
+                                } else {
+                                    "Update · partial"
+                                },
+                                inner,
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ));
+                            body.extend(render::markdown(&r.text, inner));
+                        }
+                        if r.truncated {
+                            body.extend(render::plain(
+                                "… response details shortened in this history window",
+                                inner,
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                    } else {
+                        let tool = &run.tools[index];
+                        section = format!("tool-{}", tool.call.id);
+                        body.extend(render::plain(
+                            &format!("{} · {:?}", tool.call.name, tool.status),
+                            inner,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ));
+                        body.extend(render::plain(
+                            &tool.call.arguments.to_string(),
+                            inner,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        if !tool.preview.is_empty() {
+                            body.extend(render::plain(&tool.preview, inner, Style::default()));
+                        }
+                        if !tool.output.is_empty() && tool.output != tool.preview {
+                            body.extend(render::plain(&tool.output, inner, Style::default()));
+                        }
+                        if tool.truncated {
+                            body.extend(render::plain(
+                                "… output shortened; full permitted output is saved locally",
+                                inner,
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                    }
+                    body.push(Line::default());
+                    document.section(&run.id, &section, render::bordered_body(body, width));
+                }
+                document.section(&run.id, "activity-end", vec![footer]);
+            } else {
+                document.section(
+                    &run.id,
+                    "activity",
+                    render::plain(
+                        &format!("▸ {activity} · Ctrl+O to expand"),
+                        width,
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                );
+            }
+            let mut outcome = Vec::new();
+            for tool in &run.tools {
+                if matches!(
+                    tool.status,
+                    TranscriptToolStatus::Failed | TranscriptToolStatus::Denied
+                ) {
+                    let excerpt = clean(&tool.output)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    outcome.extend(render::plain(
+                        &format!("{} · {:?}: {}", tool.call.name, tool.status, excerpt),
+                        width,
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+            if let Some(error) = &run.error {
+                outcome.extend(render::plain(
+                    error,
+                    width,
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if !run.status.is_active() {
+                let validation = match run.validation {
+                    bund_core::ValidationStatus::NotRun => "not run",
+                    bund_core::ValidationStatus::Passed => "passed",
+                    bund_core::ValidationStatus::Failed => "failed",
+                };
+                outcome.extend(render::plain(
+                    &format!("{:?} · checks {validation}", run.status),
+                    width,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if run.truncated {
+                outcome.extend(render::plain(
+                    "Some details are outside this bounded history window.",
+                    width,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            outcome.push(Line::default());
+            document.section(&run.id, "outcome", outcome);
+        }
+        for (i, notice) in self.notices.iter().enumerate() {
+            document.section("notice", &i.to_string(), render::markdown(notice, width));
+        }
+        document
+    }
     fn new(snapshot: SessionSnapshot, history: History) -> Self {
         let mut editor = TextArea::default();
         editor.set_cursor_line_style(Style::default());
@@ -69,16 +383,65 @@ impl Screen {
             pending: snapshot.pending_approval.clone(),
             snapshot,
             editor,
-            tail: String::new(),
-            sanitizer: Sanitizer::default(),
-            streamed: StreamedText::default(),
-            output_calls: HashSet::new(),
+            approval_feedback: None,
+            approval_selected: ApprovalChoice::Approve,
+            transcript: history_window(),
+            expanded: false,
+            follow: true,
+            anchor: None,
+            document: Document::default(),
+            document_dirty: true,
+            document_width: 0,
+            selection: SelectionView::new(Rect::default(), Vec::new()),
+            clipboard_task: None,
+            viewport_height: 0,
+            top: 0,
+            approval_scroll: 0,
+            history_ceiling: None,
+            history_task: None,
+            history_follow_pending: false,
+            exit_armed_at: None,
             hint: "Enter send · Alt+Enter newline · /help".into(),
+            notices: VecDeque::new(),
             history,
         }
     }
     fn draft(&self) -> String {
         self.editor.lines().join("\n")
+    }
+    fn paste(&mut self, text: &str) {
+        if self.pending.is_some() && self.approval_selected == ApprovalChoice::Feedback {
+            if let Some(editor) = &mut self.approval_feedback {
+                editor.insert_str(clean(text));
+            }
+        } else if self.pending.is_none() {
+            self.editor.insert_str(clean(text));
+        }
+    }
+    fn start_approval_feedback(&mut self) {
+        self.approval_selected = ApprovalChoice::Feedback;
+        self.approval_feedback.get_or_insert_with(|| {
+            let mut editor = TextArea::default();
+            editor.set_cursor_line_style(Style::default());
+            editor.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
+            editor.set_placeholder_text("Tell Bund what to do differently");
+            editor.set_placeholder_style(Style::default().fg(Color::DarkGray));
+            editor
+        });
+        self.hint = "Enter sends guidance · Alt+Enter newline · Esc returns to choices".into();
+    }
+    fn session_approval_available(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|request| request.session_scope.is_some())
+    }
+    fn select_approval(&mut self, choice: ApprovalChoice) {
+        self.approval_selected = choice;
+        if choice == ApprovalChoice::Feedback {
+            self.start_approval_feedback();
+        } else {
+            self.hint = "↑/↓ choose · Enter confirm · 3 type guidance".into();
+        }
     }
     fn set_draft(&mut self, text: &str) {
         self.editor = TextArea::from(text.split('\n'));
@@ -91,41 +454,172 @@ impl Screen {
             .move_cursor(ratatui_textarea::CursorMove::Bottom);
         self.editor.move_cursor(ratatui_textarea::CursorMove::End);
     }
-    fn render(&self, frame: &mut Frame) {
+    fn notice(&mut self, text: String) {
+        if self.notices.len() == 16 {
+            self.notices.pop_front();
+        }
+        self.notices.push_back(text);
+        self.document_dirty = true;
+    }
+    fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let (info, composer, footer) = composer_regions(area);
+        let (header, _, conversation, composer) = regions(area, self.pending.is_some());
+        if self.selection.area() != conversation {
+            self.selection.clear();
+        }
         let model = if self.snapshot.profile.model.is_empty() {
             "model not configured"
         } else {
             &self.snapshot.profile.model
         };
-        let status = format!(
-            "{:?} · {}\n{} / {} · {} tokens\n{}",
-            self.snapshot.status,
-            policy_status(&self.snapshot.policy),
-            self.snapshot.profile.provider,
-            model,
-            self.snapshot.usage.input_tokens + self.snapshot.usage.output_tokens,
-            wrap_lines(&self.tail, area.width as usize)
-                .last()
-                .cloned()
-                .unwrap_or_default()
-        );
-        if let Some(pending) = &self.pending {
-            let prompt = format!("Approval required: {}\nCtrl+Y: approve once  Ctrl+N / Esc: deny\nYour draft is preserved.", clean(&pending.tool_call.name));
-            frame.render_widget(
-                Paragraph::new(prompt).style(Style::default().fg(Color::Yellow)),
-                info,
-            );
+        let view = if self.follow {
+            ""
         } else {
+            " · Browsing history"
+        };
+        let workspace = self
+            .snapshot
+            .workspace
+            .file_name()
+            .unwrap_or(self.snapshot.workspace.as_os_str())
+            .to_string_lossy();
+        let mode = if header.width >= 120 {
+            policy_status(&self.snapshot.policy)
+        } else {
+            format!("{:?}", self.snapshot.policy.mode)
+        };
+        let headings = vec![
+            Line::styled(
+                clean(&format!(
+                    "Bund · {workspace} · session {}",
+                    self.snapshot.id
+                )),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(clean(&format!(
+                "{} / {} · {} · {:?} · {} tokens{}",
+                self.snapshot.profile.provider,
+                model,
+                mode,
+                self.snapshot.status,
+                self.snapshot.usage.input_tokens + self.snapshot.usage.output_tokens,
+                view
+            ))),
+            Line::styled(
+                format!(
+                    "Ctrl+O activity {} · PgUp/PgDn scroll · Ctrl+End latest{}",
+                    if self.expanded { "open" } else { "hidden" },
+                    view
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::styled(clean(self.display_hint()), Style::default().fg(Color::Cyan)),
+        ];
+        let mut headings = if header.height == 1 {
+            vec![Line::from(clean(&format!(
+                "Bund · {:?}{} · {}",
+                self.snapshot.status,
+                view,
+                self.display_hint()
+            )))]
+        } else {
+            headings
+        };
+        // Confirmation must stay visible when optional header rows are cropped.
+        if header.height > 0
+            && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+        {
+            let row = (header.height as usize).min(headings.len()) - 1;
+            headings[row] =
+                Line::styled(clean(self.display_hint()), Style::default().fg(Color::Cyan));
+        }
+        frame.render_widget(Paragraph::new(headings), header);
+        self.viewport_height = conversation.height as usize;
+        if let Some(request) = &self.pending {
+            let preview = render::plain(
+                &format!(
+                    "Workspace: {}\n{}",
+                    request.workspace.display(),
+                    request.preview
+                ),
+                conversation.width as usize,
+                Style::default(),
+            );
+            let max = preview.len().saturating_sub(conversation.height as usize);
+            self.approval_scroll = self.approval_scroll.min(max);
+            let visible = preview
+                .into_iter()
+                .skip(self.approval_scroll)
+                .take(conversation.height as usize)
+                .collect::<Vec<_>>();
+            if !self.selection.is_active() {
+                self.selection = SelectionView::new(
+                    conversation,
+                    visible.iter().cloned().map(SelectionRow::new).collect(),
+                );
+            }
+            frame.render_widget(Paragraph::new(visible), conversation);
+        } else {
+            if self.document_dirty || self.document_width != conversation.width {
+                self.document = self.build_document(conversation.width as usize);
+                self.document_width = conversation.width;
+                self.document_dirty = false;
+            }
+            let max = self
+                .document
+                .rows
+                .len()
+                .saturating_sub(conversation.height as usize);
+            self.top = if self.follow {
+                max
+            } else {
+                self.anchor
+                    .as_ref()
+                    .map(|a| self.document.position(a))
+                    .unwrap_or(self.top)
+                    .min(max)
+            };
+            self.anchor = self
+                .document
+                .rows
+                .get(self.top)
+                .map(|row| row.anchor.clone());
+            if !self.selection.is_active() {
+                self.selection = SelectionView::new(
+                    conversation,
+                    self.document
+                        .rows
+                        .iter()
+                        .skip(self.top)
+                        .take(conversation.height as usize)
+                        .map(|row| {
+                            let selected = SelectionRow::new(row.line.clone());
+                            if matches!(row.anchor.section.as_str(), "prompt" | "answer") {
+                                selected.copy_columns(2..conversation.width as usize)
+                            } else {
+                                selected
+                            }
+                        })
+                        .collect(),
+                );
+            }
             frame.render_widget(
-                Paragraph::new(clean(&status)).style(Style::default().fg(Color::Cyan)),
-                info,
+                Paragraph::new(
+                    self.document
+                        .rows
+                        .iter()
+                        .skip(self.top)
+                        .take(conversation.height as usize)
+                        .map(|row| row.line.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                conversation,
             );
         }
-        let borders = if composer.width < 3 {
+        self.selection.paint(frame);
+        let borders = if composer.width < 3 || composer.height < 2 {
             Borders::NONE
-        } else if composer.height < 3 {
+        } else if composer.height < 3 || (self.pending.is_some() && composer.height < 5) {
             Borders::LEFT | Borders::RIGHT
         } else {
             Borders::ALL
@@ -133,70 +627,220 @@ impl Screen {
         let mut block = Block::default()
             .borders(borders)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if self.pending.is_some() {
-                Color::Yellow
+            .border_style(Style::default().fg(Color::Cyan));
+        if borders.contains(Borders::TOP) {
+            let title = if header.height == 0
+                && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+            {
+                self.display_hint().to_owned()
+            } else if let Some(request) = &self.pending {
+                format!(
+                    " Approval: {} · draft saved ",
+                    clean(&request.tool_call.name)
+                )
             } else {
-                Color::Cyan
-            }));
-        if composer.height >= 3 && composer.width >= 3 {
-            block = block.title(if self.pending.is_some() {
-                " Ask bund · draft paused "
-            } else {
-                " Ask bund "
-            });
+                " Ask bund ".into()
+            };
+            block = block.title(title);
         }
         let input = block.inner(composer);
         frame.render_widget(block, composer);
-        // Approval only pauses editing. It never replaces or hides the draft.
-        frame.render_widget(&self.editor, input);
-        let hint = if self.pending.is_some() {
-            "Ctrl+Y approve once · Ctrl+N / Esc deny · draft paused"
+        if self.pending.is_some() {
+            self.render_approval(frame, input);
         } else {
-            &self.hint
+            let editor = &mut self.editor;
+            frame.render_widget(&*editor, input);
+            // The textarea retains its old scroll origin after a tiny window grows.
+            // Once its new viewport is known, reveal a short draft in full. Scrolling
+            // cannot move the cursor here because every line fits the new viewport.
+            if editor.lines().len() <= input.height as usize
+                && editor.lines().iter().all(|line| {
+                    unicode_width::UnicodeWidthStr::width(line.as_str()) <= input.width as usize
+                })
+            {
+                let (row, col) = editor.scroll_offset();
+                if row != 0 || col != 0 {
+                    editor.scroll((
+                        -(row.min(i16::MAX as u16) as i16),
+                        -(col.min(i16::MAX as u16) as i16),
+                    ));
+                    frame.render_widget(&*editor, input);
+                }
+            }
+        }
+        if header.height == 0
+            && composer.height > 0
+            && !borders.contains(Borders::TOP)
+            && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+        {
+            // A tiny composer can have no header or title;
+            // temporarily show confirmation without changing the stored draft.
+            frame.render_widget(
+                Paragraph::new(clean(self.display_hint())).style(Style::default().fg(Color::Cyan)),
+                Rect::new(composer.x, composer.y, composer.width, 1),
+            );
+        }
+    }
+    fn render_approval(&mut self, frame: &mut Frame, input: Rect) {
+        if input.is_empty() {
+            return;
+        }
+        let focused = self.approval_selected == ApprovalChoice::Feedback;
+        let action = |choice, text: &'static str| {
+            Span::styled(
+                text,
+                if choice == ApprovalChoice::Session && !self.session_approval_available() {
+                    Style::default().fg(Color::DarkGray)
+                } else if self.approval_selected == choice {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )
         };
+        let marker = |choice| {
+            if self.approval_selected == choice {
+                "› "
+            } else {
+                "  "
+            }
+        };
+        if input.height == 1 && !focused {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    action(ApprovalChoice::Approve, "1 Once"),
+                    Span::raw(" "),
+                    action(ApprovalChoice::Session, "2 Session"),
+                    Span::styled(" 3 Give instructions", Style::default().fg(Color::DarkGray)),
+                ])),
+                input,
+            );
+            return;
+        }
+        let actions = if input.height >= 3 {
+            vec![
+                Line::from(vec![
+                    Span::raw(marker(ApprovalChoice::Approve)),
+                    action(ApprovalChoice::Approve, "1 Approve once"),
+                ]),
+                Line::from(vec![
+                    Span::raw(marker(ApprovalChoice::Session)),
+                    action(ApprovalChoice::Session, "2 Approve for this session"),
+                ]),
+            ]
+        } else if input.height == 2 {
+            vec![Line::from(vec![
+                action(ApprovalChoice::Approve, "1 Once"),
+                Span::raw(" · "),
+                action(ApprovalChoice::Session, "2 Session"),
+            ])]
+        } else {
+            Vec::new()
+        };
+        let action_rows = actions.len() as u16;
         frame.render_widget(
-            Paragraph::new(clean(hint)).style(Style::default().fg(Color::DarkGray)),
-            footer,
+            Paragraph::new(actions),
+            Rect::new(input.x, input.y, input.width, action_rows),
         );
+        let field_row = input.bottom() - 1;
+        let prefix = format!("{}3 ", marker(ApprovalChoice::Feedback));
+        frame.render_widget(
+            Paragraph::new(prefix).style(Style::default().fg(if focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            })),
+            Rect::new(input.x, field_row, input.width.min(4), 1),
+        );
+        let field = Rect::new(
+            input.x + input.width.min(4),
+            field_row,
+            input.width.saturating_sub(4),
+            1,
+        );
+        if let Some(editor) = self
+            .approval_feedback
+            .as_mut()
+            .filter(|editor| !editor.is_empty())
+        {
+            editor.set_cursor_style(if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            });
+            frame.render_widget(&*editor, field);
+        } else {
+            frame.render_widget(
+                Paragraph::new("Tell Bund what to do differently")
+                    .style(Style::default().fg(Color::DarkGray)),
+                field,
+            );
+            if focused && !field.is_empty() {
+                frame.buffer_mut()[(field.x, field.y)]
+                    .set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+    fn move_rows(&mut self, down: bool, step: usize) {
+        if self.pending.is_some() {
+            self.approval_scroll = if down {
+                self.approval_scroll.saturating_add(step)
+            } else {
+                self.approval_scroll.saturating_sub(step)
+            };
+            return;
+        }
+        self.follow = false;
+        let max = self
+            .document
+            .rows
+            .len()
+            .saturating_sub(self.viewport_height);
+        self.top = if down {
+            self.top.saturating_add(step).min(max)
+        } else {
+            self.top.saturating_sub(step)
+        };
+        self.anchor = self
+            .document
+            .rows
+            .get(self.top)
+            .map(|row| row.anchor.clone());
     }
 }
 
-fn composer_regions(area: Rect) -> (Rect, Rect, Rect) {
-    // Always reserve actual editing space first. Tiny terminals progressively
-    // omit status and footer, rather than allocating an invisible textarea.
-    let footer = u16::from(area.height >= 4);
-    let info = if area.height >= 8 {
+fn regions(area: Rect, pending: bool) -> (Rect, Rect, Rect, Rect) {
+    let input = if pending || area.height >= 10 {
+        5
+    } else if area.height >= 4 {
         3
-    } else if area.height >= 5 {
-        1
     } else {
-        0
+        1
+    }
+    .min(area.height);
+    let remaining = area.height.saturating_sub(input);
+    let preferred = if area.height >= 15 {
+        4
+    } else if area.height >= 10 {
+        3
+    } else {
+        1
     };
-    let composer = area.height.saturating_sub(info + footer);
+    let header = preferred.min(remaining.saturating_sub(1));
+    let middle = remaining.saturating_sub(header);
     (
-        Rect::new(area.x, area.y, area.width, info),
-        Rect::new(area.x, area.y + info, area.width, composer),
+        Rect::new(area.x, area.y, area.width, header),
+        Rect::new(area.x, area.y + header + middle, area.width, 0),
+        Rect::new(area.x, area.y + header, area.width, middle),
         Rect::new(
             area.x,
-            area.bottom().saturating_sub(footer),
+            area.bottom().saturating_sub(input),
             area.width,
-            footer,
+            input,
         ),
     )
-}
-
-fn pin_to_bottom<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
-    terminal.autoresize()?;
-    let size = terminal.size()?;
-    let viewport = terminal.get_frame().area();
-    let gap = size.height.saturating_sub(viewport.bottom());
-    if gap > 0 {
-        // Inline resize can place the viewport above the bottom (and a width
-        // shrink deliberately resets its origin). Padding through insert_before
-        // reanchors it using Ratatui's existing primary-screen scrollback path.
-        terminal.insert_before(gap, |_| {})?;
-    }
-    Ok(())
 }
 
 fn policy_status(policy: &Policy) -> String {
@@ -208,10 +852,11 @@ fn policy_status(policy: &Policy) -> String {
     } else {
         "reviewed"
     };
-    let grants = if policy.allowed_commands.is_empty() {
+    let grant_count = policy.allowed_commands.len() + policy.session_commands.len();
+    let grants = if grant_count == 0 {
         String::new()
     } else {
-        format!(" ({} exact grants)", policy.allowed_commands.len())
+        format!(" ({grant_count} exact grants)")
     };
     format!("Act · edits {edits} · shell reviewed{grants}")
 }
@@ -219,7 +864,11 @@ fn policy_status(policy: &Policy) -> String {
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -258,35 +907,10 @@ async fn run_inner(
     let mut cursor = attachment.snapshot.cursor;
     let history = History::load(history_path)?;
     let mut screen = Screen::new(attachment.snapshot, history);
+    load_latest(&handle, &mut screen);
     let _guard = TerminalGuard;
-    let (_, rows) = crossterm::terminal::size()?;
-    // Moving, then allowing Inline to append its own lines, preserves existing
-    // terminal contents in native scrollback while anchoring the initial box.
-    execute!(std::io::stdout(), MoveTo(0, rows.saturating_sub(1)))?;
-    let mut terminal = ratatui::init_with_options(TerminalOptions {
-        viewport: Viewport::Inline(9),
-    });
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
-    insert(&mut terminal, &format!("bund · session {}\nWorkspace: {}\n/help for commands. Application permissions do not sandbox shell commands.", screen.snapshot.id, screen.snapshot.workspace.display()))?;
-    for message in &screen.snapshot.messages {
-        if matches!(message.role, Role::User | Role::Assistant) && !message.text.is_empty() {
-            insert(
-                &mut terminal,
-                &format!(
-                    "{} {}",
-                    if message.role == Role::User {
-                        ">"
-                    } else {
-                        "bund:"
-                    },
-                    message.text
-                ),
-            )?;
-        }
-    }
-    if let Some(pending) = &screen.pending {
-        insert(&mut terminal, &pending.preview)?;
-    }
+    let mut terminal = ratatui::try_init()?;
+    execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     if let Some(prompt) = first_prompt {
         screen.set_draft(&prompt);
         if let Err(error) = submit(&handle, &mut screen).await {
@@ -297,213 +921,548 @@ async fn run_inner(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending_events = VecDeque::new();
     let mut dirty = true;
-    let shutdown = shutdown_signal();
+    let mut rendered_size = terminal.size()?;
+    let mut resize_settles_at = None;
+    let shutdown = termination_signal();
     tokio::pin!(shutdown);
+    let mut interrupt = InterruptListener::new()?;
     'ui: loop {
-        if let Some(event) = pending_events.pop_front() {
-            process_event(&handle, &mut screen, &mut terminal, event, &mut cursor).await?;
-            dirty = true;
-            continue;
-        }
         tokio::select! {
             _ = &mut shutdown => { handle.cancel().await?; break; },
+            signal = interrupt.recv() => {
+                signal?;
+                if request_exit(&handle, &mut screen).await? { break; }
+                dirty = true;
+            },
             _ = ticker.tick() => {
-                // Ratatui's inline insertion and resize may synchronously request
-                // the cursor position. A background EventStream would compete
-                // for Crossterm's input lock and can make those queries time out.
-                // This loop owns both input and rendering; zero-time polling
-                // never waits for input, and the bounded batch keeps work fair.
+                dirty |= screen.expire_exit_confirmation();
+                let mut resize_reported = false;
+                // One owner handles terminal input and drawing. Bound each batch
+                // so paste/output bursts cannot starve cancellation or approvals.
                 for _ in 0..32 {
                     if !crossterm::event::poll(Duration::ZERO)? { break; }
                     match crossterm::event::read()? {
                         Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                            match key_action(&handle, &mut screen, &mut terminal, key).await {
+                            match key_action(&handle, &mut screen, key).await {
                                 Ok(true) => break 'ui,
                                 Ok(false) => {},
-                                Err(error) => screen.hint = error.to_string(),
+                                Err(error) => { screen.hint = error.to_string(); screen.notice(error.to_string()); },
                             }
                             dirty = true;
                         },
-                        Event::Paste(text) if screen.pending.is_none() => { screen.editor.insert_str(clean(&text)); dirty = true; },
-                        Event::Resize(_, _) => dirty = true,
+                        Event::Paste(text) => {
+                            screen.reset_exit_confirmation();
+                            screen.selection.clear();
+                            screen.paste(&text);
+                            dirty = true;
+                        },
+                        Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved => {
+                            screen.reset_exit_confirmation();
+                            if let Err(error) = mouse_action(&handle, &mut screen, mouse).await {
+                                screen.hint = error.to_string();
+                            }
+                            dirty = true;
+                        },
+                        Event::Resize(_, _) => { screen.selection.clear(); resize_reported = true; },
                         _ => {},
                     }
                 }
-                if dirty { pin_to_bottom(&mut terminal)?; terminal.draw(|frame| screen.render(frame))?; dirty = false; }
+                for _ in 0..64 {
+                    let Some(event) = pending_events.pop_front() else { break; };
+                    process_event(&handle, &mut screen, event, &mut cursor, &mut pending_events).await?;
+                    dirty = true;
+                }
+                match poll_history(&handle, &mut screen, cursor).await {
+                    Ok(changed) => dirty |= changed,
+                    Err(error) => {
+                        screen.history_follow_pending = false;
+                        screen.hint = format!("Could not load history: {error}");
+                        screen.notice(screen.hint.clone());
+                        dirty = true;
+                    },
+                }
+                if screen.clipboard_task.as_ref().is_some_and(|task| task.is_finished()) {
+                    let outcome = screen.clipboard_task.take().unwrap().await;
+                    screen.hint = match outcome {
+                        Ok(Ok(())) => "Copied selection to clipboard · Ctrl+End latest".into(),
+                        Ok(Err(error)) => format!("Could not copy selection: {error}"),
+                        Err(_) => "Clipboard copy stopped; select the text again to retry".into(),
+                    };
+                    dirty = true;
+                }
+                // Resize notifications can coalesce while a window is dragged.
+                // Query the current size even while idle, and invalidate the
+                // physical screen after any resize, including a shrink/grow
+                // round trip back to the last rendered dimensions.
+                let size = terminal.size()?;
+                let now = Instant::now();
+                let resized = resize_reported || size != rendered_size;
+                if resized {
+                    resize_settles_at = Some(now + Duration::from_millis(150));
+                }
+                let settled = resize_settles_at.is_some_and(|deadline| now >= deadline);
+                if resized || settled {
+                    // A final repaint also repairs a resize that occurred while
+                    // the preceding frame was being written to the terminal.
+                    // resize() clears Ratatui's previous buffer even at the same
+                    // size, without a blocking cursor-position query.
+                    terminal.resize(size.into())?;
+                    dirty = true;
+                    if settled { resize_settles_at = None; }
+                }
+                if dirty {
+                    rendered_size = terminal.draw(|frame| screen.render(frame))?.area.as_size();
+                    dirty = false;
+                }
             },
-            received = events.recv() => match received {
-                Ok(event) => { process_event(&handle, &mut screen, &mut terminal, event, &mut cursor).await?; dirty = true; },
+            received = events.recv(), if pending_events.is_empty() => match received {
+                Ok(event) => { process_event(&handle, &mut screen, event, &mut cursor, &mut pending_events).await?; dirty = true; },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    pending_events.extend(handle.events_after(cursor, 512).await?);
+                    pending_events.extend(handle.events_after(cursor, 256).await?);
                     screen.hint = "Recovered delayed session events".into();
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
         }
     }
-    flush_tail(&mut screen, &mut terminal)?;
-    terminal.clear()?;
     terminal.show_cursor()?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn replay(handle: &SessionHandle, ceiling: u64) -> Result<Transcript> {
+    let mut transcript = history_window();
+    let mut cursor = 0;
+    while cursor < ceiling {
+        let page = handle.events_after(cursor, 256).await?;
+        let before = cursor;
+        for event in page
+            .into_iter()
+            .take_while(|event| event.sequence <= ceiling)
+        {
+            cursor = event.sequence;
+            transcript.apply(&event);
+        }
+        anyhow::ensure!(
+            cursor > before,
+            "session event history has a gap after {cursor}"
+        );
+        tokio::task::yield_now().await;
+    }
+    Ok(transcript)
+}
+
+fn history_window() -> Transcript {
+    Transcript::with_limits(bund_core::TranscriptLimits {
+        max_runs: 32,
+        max_total_bytes: 512 * 1024,
+        ..Default::default()
+    })
+}
+
+fn start_history_load(
+    screen: &mut Screen,
+    work: impl std::future::Future<Output = Result<HistoryLoad>> + Send + 'static,
+) {
+    if let Some(task) = screen.history_task.take() {
+        task.abort();
+    }
+    screen
+        .history_ceiling
+        .get_or_insert(screen.transcript.cursor());
+    screen.history_follow_pending = false;
+    screen.history_task = Some(tokio::spawn(work));
+    screen.hint = "Loading history · input and cancellation remain available".into();
+}
+
+fn load_latest(handle: &SessionHandle, screen: &mut Screen) {
+    let handle = handle.clone();
+    start_history_load(screen, async move {
+        let ceiling = handle.snapshot().await?.cursor;
+        Ok(HistoryLoad {
+            transcript: replay(&handle, ceiling).await?,
+            ceiling,
+            target: HistoryTarget::Latest,
+        })
+    });
+}
+
+/// Apply a completed background window, then catch up a latest-view load in
+/// bounded batches. Live events still update approvals/status during the load.
+async fn poll_history(
+    handle: &SessionHandle,
+    screen: &mut Screen,
+    live_cursor: u64,
+) -> Result<bool> {
+    let mut changed = false;
+    if screen
+        .history_task
+        .as_ref()
+        .is_some_and(|task| task.is_finished())
+    {
+        let loaded = screen
+            .history_task
+            .take()
+            .unwrap()
+            .await
+            .context("history loader stopped")??;
+        if loaded.transcript.runs().is_empty() && !matches!(loaded.target, HistoryTarget::Latest) {
+            if matches!(loaded.target, HistoryTarget::Top) {
+                screen.history_ceiling = Some(loaded.ceiling);
+            }
+            screen.hint = "No more conversation history in that direction".into();
+            return Ok(true);
+        }
+        screen.transcript = loaded.transcript;
+        screen.selection.clear();
+        screen.history_ceiling = Some(loaded.ceiling);
+        screen.history_follow_pending = matches!(loaded.target, HistoryTarget::Latest);
+        if !screen.history_follow_pending {
+            screen.hint = "Browsing history · PgUp/PgDn scroll · Ctrl+End latest".into();
+        }
+        screen.follow = screen.history_follow_pending;
+        screen.anchor = None;
+        screen.top = if matches!(loaded.target, HistoryTarget::Bottom) {
+            usize::MAX
+        } else {
+            0
+        };
+        screen.document_dirty = true;
+        changed = true;
+    }
+    if screen.history_follow_pending {
+        let cursor = screen.transcript.cursor();
+        if cursor < live_cursor {
+            let page = handle.events_after(cursor, 64).await?;
+            for event in page
+                .into_iter()
+                .take_while(|event| event.sequence <= live_cursor)
+            {
+                screen.transcript.apply(&event);
+            }
+            anyhow::ensure!(
+                screen.transcript.cursor() > cursor,
+                "session event history has a gap after {cursor}"
+            );
+            screen.history_ceiling = Some(screen.transcript.cursor());
+            screen.document_dirty = true;
+            changed = true;
+        }
+        if screen.transcript.cursor() >= live_cursor {
+            screen.history_follow_pending = false;
+            screen.history_ceiling = None;
+            screen.follow = true;
+            screen.hint = "Latest conversation · Enter send · /help".into();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Load complete adjacent runs. If adding a run would evict the beginning of
+/// this page, return the checkpoint before that run so PgDn cannot skip it.
+async fn forward_history(handle: &SessionHandle, after: u64, latest: u64) -> Result<HistoryLoad> {
+    let mut next = history_window();
+    let mut cursor = after;
+    let mut first_id = None;
+    let mut checkpoint = None;
+    while cursor < latest {
+        let page = handle.events_after(cursor, 256).await?;
+        let before = cursor;
+        for event in page
+            .into_iter()
+            .take_while(|event| event.sequence <= latest)
+        {
+            if matches!(event.kind, EventKind::RunStarted { .. }) && !next.runs().is_empty() {
+                checkpoint = Some((next.clone(), cursor));
+            }
+            next.apply(&event);
+            let retained = next.runs().front().map(|run| run.id.clone());
+            if first_id.is_some() && retained != first_id {
+                if let Some((transcript, ceiling)) = checkpoint {
+                    return Ok(HistoryLoad {
+                        transcript,
+                        ceiling,
+                        target: HistoryTarget::Top,
+                    });
+                }
+            }
+            if first_id.is_none() {
+                first_id = retained;
+            }
+            cursor = event.sequence;
+        }
+        anyhow::ensure!(
+            cursor > before,
+            "session event history has a gap after {cursor}"
+        );
+        tokio::task::yield_now().await;
+    }
+    Ok(HistoryLoad {
+        transcript: next,
+        ceiling: cursor,
+        target: HistoryTarget::Top,
+    })
+}
+
+async fn page_history(handle: &SessionHandle, screen: &mut Screen, down: bool) -> Result<()> {
+    let step = screen.viewport_height.saturating_sub(1).max(1);
+    scroll_history(handle, screen, down, step).await
+}
+
+async fn scroll_history(
+    handle: &SessionHandle,
+    screen: &mut Screen,
+    down: bool,
+    step: usize,
+) -> Result<()> {
+    if screen.pending.is_some() {
+        screen.move_rows(down, step);
+        return Ok(());
+    }
+    if screen.history_task.is_some() {
+        screen.hint = "History is loading · Ctrl+End returns to latest".into();
+        return Ok(());
+    }
+    // Freeze on the first scroll, before new events can evict the viewed run.
+    screen
+        .history_ceiling
+        .get_or_insert(screen.transcript.cursor());
+    screen.history_follow_pending = false;
+    screen.follow = false;
+    if !down && screen.top == 0 {
+        if let Some(first) = screen
+            .transcript
+            .runs()
+            .front()
+            .filter(|run| run.start_sequence > 1)
+        {
+            let ceiling = first.start_sequence - 1;
+            let handle = handle.clone();
+            start_history_load(screen, async move {
+                Ok(HistoryLoad {
+                    transcript: replay(&handle, ceiling).await?,
+                    ceiling,
+                    target: HistoryTarget::Bottom,
+                })
+            });
+            return Ok(());
+        }
+    }
+    if down
+        && screen.top
+            >= screen
+                .document
+                .rows
+                .len()
+                .saturating_sub(screen.viewport_height)
+    {
+        if let Some(ceiling) = screen.history_ceiling {
+            // A frozen active run may have acquired more responses; overlap its
+            // start instead of rebuilding its tail without the prompt/status.
+            let after = screen
+                .transcript
+                .runs()
+                .back()
+                .filter(|run| run.status.is_active())
+                .map(|run| run.start_sequence.saturating_sub(1))
+                .unwrap_or(ceiling);
+            let handle = handle.clone();
+            start_history_load(screen, async move {
+                let latest = handle.snapshot().await?.cursor;
+                if ceiling >= latest {
+                    return Ok(HistoryLoad {
+                        transcript: replay(&handle, latest).await?,
+                        ceiling: latest,
+                        target: HistoryTarget::Latest,
+                    });
+                }
+                forward_history(&handle, after, latest).await
+            });
+            return Ok(());
+        }
+    }
+    screen.move_rows(down, step);
+    Ok(())
+}
+
+async fn termination_signal() {
     #[cfg(unix)]
     {
         if let Ok(mut terminate) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
-            tokio::select! { _ = terminate.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+            terminate.recv().await;
             return;
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
+    std::future::pending::<()>().await;
+}
+
+/// Keep the subscription alive while input, rendering, and journal work run.
+struct InterruptListener {
+    #[cfg(unix)]
+    receiver: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    receiver: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>,
+}
+
+impl InterruptListener {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let receiver = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        #[cfg(not(unix))]
+        let receiver = Box::pin(tokio::signal::ctrl_c());
+        Ok(Self { receiver })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.receiver
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("interrupt signal stream closed"))
+        }
+        #[cfg(not(unix))]
+        {
+            let result = self.receiver.as_mut().await;
+            self.receiver = Box::pin(tokio::signal::ctrl_c());
+            result
+        }
+    }
+}
+
+async fn request_exit(handle: &SessionHandle, screen: &mut Screen) -> Result<bool> {
+    let confirmed = screen.confirm_exit_at(Instant::now());
+    // Cancellation never clears the composer. Confirmation remains armed while
+    // cancellation/status events update the ordinary hint beneath its overlay.
+    handle.cancel().await?;
+    Ok(confirmed)
 }
 
 async fn process_event(
     handle: &SessionHandle,
     screen: &mut Screen,
-    terminal: &mut ratatui::DefaultTerminal,
     event: SessionEvent,
     cursor: &mut u64,
+    pending: &mut VecDeque<SessionEvent>,
 ) -> Result<()> {
     if event.sequence <= *cursor {
         return Ok(());
     }
     if event.sequence > *cursor + 1 {
-        // A bounded replay page might leave a gap before the next broadcast event.
-        let mut next = *cursor;
-        while next + 1 < event.sequence {
-            let before = next;
-            let missing = handle.events_after(next, 512).await?;
-            if missing.is_empty() {
-                anyhow::bail!("session event history has a gap after {next}");
-            }
-            for old in missing
-                .into_iter()
-                .filter(|old| old.sequence < event.sequence)
-            {
-                next = old.sequence;
-                apply_event(handle, screen, terminal, old).await?;
-                *cursor = next;
-            }
-            if next == before {
-                anyhow::bail!("session event history has a gap after {next}");
-            }
+        // Recover only one bounded page. The tick loop processes a small batch
+        // before returning to input, even when a slow display lagged far behind.
+        let missing = handle
+            .events_after(*cursor, 256)
+            .await?
+            .into_iter()
+            .take_while(|old| old.sequence < event.sequence)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            missing
+                .first()
+                .is_some_and(|old| old.sequence == *cursor + 1),
+            "session event history has a gap after {cursor}"
+        );
+        pending.push_front(event);
+        for old in missing.into_iter().rev() {
+            pending.push_front(old);
         }
+        return Ok(());
     }
     *cursor = event.sequence;
-    apply_event(handle, screen, terminal, event).await
+    apply_event(handle, screen, event).await
 }
 
 async fn apply_event(
     handle: &SessionHandle,
     screen: &mut Screen,
-    terminal: &mut ratatui::DefaultTerminal,
     event: SessionEvent,
 ) -> Result<()> {
+    if screen.history_ceiling.is_none() {
+        screen.transcript.apply(&event);
+        screen.document_dirty = true;
+    }
     match event.kind {
-        EventKind::RunStarted { prompt } => {
-            flush_tail(screen, terminal)?;
-            screen.streamed = StreamedText::default();
-            screen.sanitizer = Sanitizer::default();
+        EventKind::RunStarted { .. } => {
             screen.snapshot.status = RunStatus::Running;
             screen.hint = "Working · Esc cancels · draft stays editable".into();
-            screen.output_calls.clear();
-            insert(terminal, &format!("> {prompt}"))?;
-        }
-        EventKind::TextDelta { text } => {
-            screen.streamed.record(&text);
-            screen.tail.push_str(&screen.sanitizer.push(&text));
-            if let Some(end) = screen.tail.rfind('\n') {
-                let complete = screen.tail[..end].to_owned();
-                screen.tail.drain(..=end);
-                insert(terminal, &complete)?;
-            }
-            // A model can stream a very long unbroken paragraph. Commit display rows
-            // while keeping a small mutable tail, rather than growing the UI buffer.
-            if screen.tail.len() > 4096 {
-                let boundary = screen
-                    .tail
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .take_while(|i| *i <= 3072)
-                    .last()
-                    .unwrap_or(0);
-                let complete = screen.tail[..boundary].to_owned();
-                screen.tail.drain(..boundary);
-                insert(terminal, &complete)?;
-            }
-        }
-        EventKind::AssistantMessage { text } => {
-            match screen.streamed.finish(&text) {
-                FinalText::Append(suffix) => {
-                    screen.tail.push_str(&screen.sanitizer.push(suffix));
-                    flush_tail(screen, terminal)?;
-                }
-                FinalText::Replace(text) => {
-                    flush_tail(screen, terminal)?;
-                    insert(terminal, &format!("Final response:\n{text}"))?;
-                }
-            }
-            screen.sanitizer = Sanitizer::default();
         }
         EventKind::ApprovalRequired(request) => {
-            flush_tail(screen, terminal)?;
-            insert(
-                terminal,
-                &format!(
-                    "Approval required: {}\n{}",
-                    request.tool_call.name, request.preview
-                ),
-            )?;
+            screen.approval_feedback = None;
+            screen.approval_selected = ApprovalChoice::Approve;
+            screen.selection.clear();
             screen.pending = Some(request);
+            screen.approval_scroll = 0;
             screen.snapshot.status = RunStatus::AwaitingApproval;
-            screen.hint =
-                "Ctrl+Y approve once · Ctrl+N deny · approval never expires automatically".into();
+            screen.hint = "↑/↓ choose · Enter confirm · 3 type guidance".into();
         }
         EventKind::ApprovalResolved { .. } => {
+            screen.approval_feedback = None;
+            screen.selection.clear();
             screen.pending = None;
             screen.snapshot.status = RunStatus::Running;
         }
         EventKind::ToolStarted { call } => {
-            screen.hint = format!("Running {} · Esc cancels", call.name);
-            insert(terminal, &format!("• {}", call.name))?;
+            screen.hint = format!("Running {} · Esc cancels", clean(&call.name))
         }
-        EventKind::ToolOutput { call_id, text } => {
-            screen.output_calls.insert(call_id);
-            insert(terminal, &text)?;
+        EventKind::ToolFinished(result) if result.is_error => {
+            screen.hint = format!("{} failed · see conversation", clean(&result.name))
         }
-        EventKind::ToolFinished(result) => {
-            if !screen.output_calls.contains(&result.call_id) && !result.content.is_empty() {
-                let content = if result.name == "git_diff" || result.name == "git_status" {
-                    result.content
-                } else {
-                    excerpt(&result.content, 20)
-                };
-                insert(terminal, &content)?;
-            }
-            if result.is_error {
-                screen.hint = format!("{} failed; see output above", result.name);
-            }
-        }
-        EventKind::ContextCompacted { summary } => {
-            insert(terminal, &format!("Context compacted:\n{summary}"))?
-        }
+        EventKind::ContextCompacted { .. } => screen.hint = "Context compacted".into(),
         EventKind::SettingsChanged => screen.snapshot = handle.snapshot().await?,
         EventKind::RunFinished {
-            status,
-            message,
-            validation,
+            status, validation, ..
         } => {
-            flush_tail(screen, terminal)?;
+            if screen.pending.is_some() {
+                screen.selection.clear();
+            }
+            screen.approval_feedback = None;
             screen.pending = None;
-            screen.streamed = StreamedText::default();
-            screen.sanitizer = Sanitizer::default();
             screen.snapshot = handle.snapshot().await?;
-            screen.hint = format!("{status:?} · checks {validation:?} · {}", clean(&message));
-            if status != RunStatus::Completed {
-                insert(terminal, &screen.hint)?;
+            screen.hint = format!("{status:?} · checks {validation:?} · Enter send · /help");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn mouse_action(
+    handle: &SessionHandle,
+    screen: &mut Screen,
+    mouse: MouseEvent,
+) -> Result<()> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            screen.selection.clear();
+            scroll_history(handle, screen, mouse.kind == MouseEventKind::ScrollDown, 3).await?;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if screen.selection.start(mouse.column, mouse.row) {
+                // Keep the text under the mouse fixed while the model continues.
+                screen
+                    .history_ceiling
+                    .get_or_insert(screen.transcript.cursor());
+                screen.history_follow_pending = false;
+                screen.follow = false;
+                screen.hint = "Drag to highlight · release to copy".into();
+            } else {
+                screen.selection.clear();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            screen.selection.drag(mouse.column, mouse.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            screen.selection.drag(mouse.column, mouse.row);
+            if let Some(text) = screen.selection.finish().filter(|text| !text.is_empty()) {
+                if screen.clipboard_task.is_none() {
+                    screen.clipboard_task = Some(tokio::spawn(clipboard::copy(text)));
+                    screen.hint = "Copying selection…".into();
+                } else {
+                    screen.hint = "Clipboard copy is still finishing; select again to retry".into();
+                }
             }
         }
         _ => {}
@@ -511,25 +1470,156 @@ async fn apply_event(
     Ok(())
 }
 
-fn flush_tail(screen: &mut Screen, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    if !screen.tail.is_empty() {
-        insert(terminal, &std::mem::take(&mut screen.tail))?;
+async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+    use crossterm::event::KeyEventKind;
+    if key.kind == KeyEventKind::Release {
+        return Ok(false);
     }
-    Ok(())
-}
-
-async fn key_action(
-    handle: &SessionHandle,
-    screen: &mut Screen,
-    terminal: &mut ratatui::DefaultTerminal,
-    key: KeyEvent,
-) -> Result<bool> {
-    if let Some(request) = &screen.pending {
-        if let Some(decision) = approval_key(key) {
-            handle.answer_approval(&request.id, decision).await?;
-            screen.pending = None;
-        } else if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            handle.cancel().await?;
+    screen.selection.clear();
+    if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return if key.kind == KeyEventKind::Press {
+            request_exit(handle, screen).await
+        } else {
+            // Ignore repeats when the terminal identifies them.
+            Ok(false)
+        };
+    }
+    screen.reset_exit_confirmation();
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('d'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+            screen.hint = EXIT_INSTRUCTION.into();
+            return Ok(false);
+        }
+        (KeyCode::Enter, mods)
+            if !mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                && screen.pending.is_none()
+                && screen.draft().trim() == "/exit" =>
+        {
+            screen.hint = EXIT_INSTRUCTION.into();
+            return Ok(false);
+        }
+        (KeyCode::Char('o'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+            screen.expanded = !screen.expanded;
+            screen.document_dirty = true;
+            return Ok(false);
+        }
+        (KeyCode::End, mods) if mods.contains(KeyModifiers::CONTROL) => {
+            if screen.pending.is_some() {
+                screen.approval_scroll = usize::MAX;
+            } else if screen.history_ceiling.is_some() || screen.history_task.is_some() {
+                load_latest(handle, screen);
+            } else {
+                screen.follow = true;
+            }
+            return Ok(false);
+        }
+        (KeyCode::PageUp, _) | (KeyCode::PageDown, _) => {
+            page_history(handle, screen, key.code == KeyCode::PageDown).await?;
+            return Ok(false);
+        }
+        _ => {}
+    }
+    if let Some(id) = screen.pending.as_ref().map(|request| request.id.clone()) {
+        if key.kind != KeyEventKind::Press && key.code == KeyCode::Enter {
+            return Ok(false);
+        }
+        if screen.approval_selected != ApprovalChoice::Feedback
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('n')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            if key.kind == KeyEventKind::Press {
+                handle.answer_approval(&id, ApprovalDecision::Deny).await?;
+                screen.approval_feedback = None;
+                screen.pending = None;
+            }
+            return Ok(false);
+        }
+        if screen.approval_selected == ApprovalChoice::Feedback {
+            let editor = screen
+                .approval_feedback
+                .as_mut()
+                .expect("focused guidance editor");
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    screen.select_approval(if screen.session_approval_available() {
+                        ApprovalChoice::Session
+                    } else {
+                        ApprovalChoice::Approve
+                    });
+                }
+                (KeyCode::Up, mods) if mods.is_empty() && editor.cursor().0 == 0 => {
+                    screen.select_approval(if screen.session_approval_available() {
+                        ApprovalChoice::Session
+                    } else {
+                        ApprovalChoice::Approve
+                    });
+                }
+                (KeyCode::Enter, mods)
+                    if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                {
+                    editor.insert_newline();
+                }
+                (KeyCode::Char('j'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                    editor.insert_newline();
+                }
+                (KeyCode::Enter, _) => {
+                    let feedback = editor.lines().join("\n");
+                    anyhow::ensure!(
+                        !feedback.trim().is_empty(),
+                        "Enter guidance for Bund, or press Esc to return to the choices."
+                    );
+                    anyhow::ensure!(
+                        feedback.len() <= bund_core::MAX_APPROVAL_FEEDBACK_BYTES,
+                        "Guidance is too long; use at most 16 KiB."
+                    );
+                    handle
+                        .answer_approval(&id, ApprovalDecision::DenyWithFeedback { feedback })
+                        .await?;
+                    screen.approval_feedback = None;
+                    screen.pending = None;
+                    screen.hint =
+                        "Guidance sent · proposed action skipped · original draft restored".into();
+                }
+                _ => {
+                    editor.input(key);
+                }
+            }
+        } else if matches!(key.code, KeyCode::Up | KeyCode::Down) && key.modifiers.is_empty() {
+            let choice = match (screen.approval_selected, key.code) {
+                (ApprovalChoice::Approve, KeyCode::Down) if screen.session_approval_available() => {
+                    ApprovalChoice::Session
+                }
+                (_, KeyCode::Down) => ApprovalChoice::Feedback,
+                (_, KeyCode::Up) => ApprovalChoice::Approve,
+                _ => screen.approval_selected,
+            };
+            screen.select_approval(choice);
+        } else if let Some(choice) = if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            Some(screen.approval_selected)
+        } else {
+            approval_key(key)
+        } {
+            let decision = match choice {
+                ApprovalChoice::Approve => Some(ApprovalDecision::ApproveOnce),
+                ApprovalChoice::Session => {
+                    anyhow::ensure!(
+                        screen.session_approval_available(),
+                        "Session approval is unavailable for this action; choose Approve once."
+                    );
+                    Some(ApprovalDecision::ApproveSession)
+                }
+                ApprovalChoice::Feedback => {
+                    screen.start_approval_feedback();
+                    None
+                }
+            };
+            if let Some(decision) = decision {
+                handle.answer_approval(&id, decision).await?;
+                screen.approval_feedback = None;
+                screen.pending = None;
+            }
         }
         return Ok(false);
     }
@@ -538,24 +1628,8 @@ async fn key_action(
             if screen.snapshot.status.is_active() {
                 handle.cancel().await?;
             } else {
-                screen.hint = "Enter sends your draft · /exit quits".into();
+                screen.hint = format!("Enter sends your draft · {EXIT_INSTRUCTION}");
             }
-        }
-        (KeyCode::Char('c'), mods) if mods.contains(KeyModifiers::CONTROL) => {
-            if screen.snapshot.status.is_active() {
-                handle.cancel().await?;
-            } else if screen.draft().is_empty() {
-                return Ok(true);
-            } else {
-                screen.set_draft("");
-                screen.hint = "Draft cleared · Ctrl+C again exits".into();
-            }
-        }
-        (KeyCode::Char('d'), mods)
-            if mods.contains(KeyModifiers::CONTROL) && screen.draft().is_empty() =>
-        {
-            handle.cancel().await?;
-            return Ok(true);
         }
         (KeyCode::Enter, mods)
             if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT) =>
@@ -567,12 +1641,8 @@ async fn key_action(
         }
         (KeyCode::Enter, _) => {
             let draft = screen.draft();
-            if draft.trim() == "/exit" {
-                handle.cancel().await?;
-                return Ok(true);
-            }
             if draft.trim() == "/help" {
-                insert(terminal, HELP)?;
+                screen.notice(HELP.into());
                 screen.set_draft("");
             } else {
                 submit(handle, screen).await?;
@@ -597,15 +1667,24 @@ async fn key_action(
     Ok(false)
 }
 
-fn approval_key(key: KeyEvent) -> Option<ApprovalDecision> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    Session,
+    Feedback,
+}
+
+fn approval_key(key: KeyEvent) -> Option<ApprovalChoice> {
+    if key.kind != crossterm::event::KeyEventKind::Press {
+        return None;
+    }
     match key.code {
+        KeyCode::Char('1') if key.modifiers.is_empty() => Some(ApprovalChoice::Approve),
+        KeyCode::Char('2') if key.modifiers.is_empty() => Some(ApprovalChoice::Session),
+        KeyCode::Char('3') if key.modifiers.is_empty() => Some(ApprovalChoice::Feedback),
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalDecision::ApproveOnce)
+            Some(ApprovalChoice::Approve)
         }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalDecision::Deny)
-        }
-        KeyCode::Esc => Some(ApprovalDecision::Deny),
         _ => None,
     }
 }
@@ -614,6 +1693,10 @@ async fn submit(handle: &SessionHandle, screen: &mut Screen) -> Result<()> {
     let draft = screen.draft();
     let text = draft.trim();
     if text.is_empty() {
+        return Ok(());
+    }
+    if text == "/exit" {
+        screen.hint = EXIT_INSTRUCTION.into();
         return Ok(());
     }
     if screen.snapshot.status.is_active() {
@@ -675,6 +1758,10 @@ async fn submit(handle: &SessionHandle, screen: &mut Screen) -> Result<()> {
             handle.submit(draft.clone()).await?;
         }
     }
+    if screen.history_ceiling.is_some() || screen.history_task.is_some() {
+        load_latest(handle, screen);
+    }
+    screen.follow = true;
     // Only clear and record after the engine accepts the request. Busy/errors leave
     // both the draft and the current cursor/selection intact.
     let history_error = screen.history.record(&draft).err();
@@ -745,54 +1832,6 @@ fn complete(screen: &mut Screen) {
             screen.hint = candidates.join("  ");
         }
     }
-}
-
-fn insert(terminal: &mut ratatui::DefaultTerminal, text: &str) -> Result<()> {
-    pin_to_bottom(terminal)?;
-    let width = terminal.size()?.width.max(1) as usize;
-    let lines = wrap_lines(&clean(text), width);
-    for chunk in lines.chunks(200) {
-        terminal.insert_before(chunk.len() as u16, |buffer| {
-            use ratatui::widgets::Widget;
-            Paragraph::new(chunk.iter().cloned().map(Line::from).collect::<Vec<_>>())
-                .render(buffer.area, buffer);
-        })?;
-    }
-    Ok(())
-}
-
-fn wrap_lines(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut result = Vec::new();
-    for line in text.split('\n') {
-        let mut current = String::new();
-        let mut length = 0;
-        for grapheme in line.graphemes(true) {
-            let size = UnicodeWidthStr::width(grapheme);
-            if length + size > width && !current.is_empty() {
-                result.push(std::mem::take(&mut current));
-                length = 0;
-            }
-            if size > width {
-                current.push('�');
-                length += 1;
-            } else {
-                current.push_str(grapheme);
-                length += size;
-            }
-        }
-        result.push(current);
-    }
-    result
-}
-
-fn excerpt(text: &str, count: usize) -> String {
-    let mut lines = text.lines();
-    let mut output = lines.by_ref().take(count).collect::<Vec<_>>().join("\n");
-    if lines.next().is_some() {
-        output.push_str("\n… more output is saved in this session");
-    }
-    output
 }
 
 struct History {
@@ -877,6 +1916,10 @@ impl History {
 }
 
 #[cfg(test)]
+#[path = "ui_history_tests.rs"]
+mod history_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
@@ -913,15 +1956,453 @@ mod tests {
             .collect()
     }
 
+    async fn exit_fixture() -> (SessionHandle, tempfile::TempDir, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(bund_store::SqliteStore::open(data.path()).unwrap());
+        let engine = bund_core::Engine::new(bund_core::EngineDependencies {
+            providers: vec![],
+            tools: bund_tools::built_in_tools(),
+            store,
+        })
+        .unwrap();
+        let handle = engine
+            .create_session(bund_core::SessionOptions::new(
+                workspace.path().into(),
+                bund_core::ModelProfile::new("fixture", "offline"),
+            ))
+            .await
+            .unwrap();
+        (handle, workspace, data)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[tokio::test]
+    async fn exit_requires_two_consecutive_presses_and_preserves_empty_or_nonempty_drafts() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        for draft in ["", "keep this draft\nand its newline"] {
+            let mut screen = test_screen();
+            screen.set_draft(draft);
+            assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+            assert_eq!(screen.draft(), draft);
+            assert_eq!(screen.display_hint(), EXIT_CONFIRM);
+            // Asynchronous status updates cannot hide the confirmation hint.
+            screen.hint = "Cancelled; edits remain".into();
+            assert_eq!(screen.display_hint(), EXIT_CONFIRM);
+            assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+            assert_eq!(screen.draft(), draft);
+        }
+    }
+
+    #[tokio::test]
+    async fn intervening_input_and_autorepeat_cannot_confirm_exit() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        let mut repeat = ctrl_c();
+        repeat.kind = crossterm::event::KeyEventKind::Repeat;
+        assert!(!key_action(&handle, &mut screen, repeat).await.unwrap());
+        assert!(screen.exit_armed_at.is_some());
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert!(screen.exit_armed_at.is_none());
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        // Paste and mouse handlers use this same reset operation.
+        screen.reset_exit_confirmation();
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        let mut release = ctrl_c();
+        release.kind = crossterm::event::KeyEventKind::Release;
+        assert!(!key_action(&handle, &mut screen, release).await.unwrap());
+        assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        assert_eq!(screen.draft(), "x");
+    }
+
     #[test]
-    fn composer_stays_visible_when_approval_pauses_editing() {
+    fn exit_confirmation_expires_and_late_press_starts_a_new_window() {
+        let mut screen = test_screen();
+        let now = Instant::now();
+        assert!(!screen.confirm_exit_at(now));
+        assert!(!screen.confirm_exit_at(now + EXIT_WINDOW + Duration::from_millis(1)));
+        screen.exit_armed_at = Some(Instant::now() - EXIT_WINDOW - Duration::from_millis(1));
+        assert!(screen.expire_exit_confirmation());
+        assert!(screen.exit_armed_at.is_none());
+        assert_ne!(screen.display_hint(), EXIT_CONFIRM);
+        assert!(!screen.expire_exit_confirmation());
+    }
+
+    #[test]
+    fn exit_confirmation_is_visible_in_short_terminal_headers() {
+        let mut screen = test_screen();
+        screen.set_draft("preserved even in a one-row terminal");
+        screen.confirm_exit_at(Instant::now());
+        for height in [1, 2, 4, 8, 10, 11, 14, 24] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let text = (0..height)
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains(EXIT_CONFIRM),
+                "confirmation missing at height {height}: {text}"
+            );
+            assert_eq!(screen.draft(), "preserved even in a one-row terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_command_and_ctrl_d_only_explain_the_confirmation_shortcut() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        screen.set_draft("/exit");
+        assert!(!key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        )
+        .await
+        .unwrap());
+        assert_eq!(screen.hint, EXIT_INSTRUCTION);
+        assert_eq!(screen.draft(), "/exit");
+        assert!(screen.exit_armed_at.is_none());
+        screen.set_draft("");
+        assert!(!key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+        )
+        .await
+        .unwrap());
+        assert_eq!(screen.hint, EXIT_INSTRUCTION);
+        assert!(screen.exit_armed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn first_exit_press_cancels_pending_work_and_second_exits_during_history_loading() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut events = handle.attach().await.unwrap().events;
+        handle
+            .run_tool("run_command", serde_json::json!({"command":"sleep 5"}))
+            .await
+            .unwrap();
+        let mut screen = test_screen();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let pending = matches!(event.kind, EventKind::ApprovalRequired(_));
+                apply_event(&handle, &mut screen, event).await.unwrap();
+                if pending {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        screen.set_draft("preserve while cancelling");
+        screen.start_approval_feedback();
+        screen.paste("unsent guidance");
+        start_history_load(&mut screen, std::future::pending());
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        assert!(screen.pending.is_some());
+        assert_eq!(screen.draft(), "preserve while cancelling");
+        // No approval or cancelled state transition needs to finish first.
+        assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let finished = matches!(
+                    event.kind,
+                    EventKind::RunFinished {
+                        status: RunStatus::Cancelled,
+                        ..
+                    }
+                );
+                apply_event(&handle, &mut screen, event).await.unwrap();
+                if finished {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(screen.draft(), "preserve while cancelling");
+        assert!(screen.approval_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn numbered_and_arrow_choices_approve_or_deny_only_the_pending_action() {
+        for (keys, approved, session) in [
+            (vec![KeyCode::Char('1')], true, false),
+            (vec![KeyCode::Char('2')], true, true),
+            (vec![KeyCode::Esc], false, false),
+            (
+                vec![KeyCode::Down, KeyCode::Up, KeyCode::Enter],
+                true,
+                false,
+            ),
+            (vec![KeyCode::Down, KeyCode::Enter], true, true),
+            (vec![KeyCode::Down, KeyCode::Esc], false, false),
+        ] {
+            let (handle, workspace, _data) = exit_fixture().await;
+            let mut events = handle.attach().await.unwrap().events;
+            handle
+                .run_tool(
+                    "apply_patch",
+                    serde_json::json!({"path":"decision.txt", "content":"approved content"}),
+                )
+                .await
+                .unwrap();
+            let mut screen = test_screen();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while screen.pending.is_none() {
+                    apply_event(&handle, &mut screen, events.recv().await.unwrap())
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            screen.set_draft("saved draft");
+            if keys == [KeyCode::Char('1')] {
+                let scope = screen.pending.as_mut().unwrap().session_scope.take();
+                assert!(key_action(
+                    &handle,
+                    &mut screen,
+                    KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+                )
+                .await
+                .is_err());
+                assert!(screen.pending.is_some());
+                assert!(!workspace.path().join("decision.txt").exists());
+                key_action(
+                    &handle,
+                    &mut screen,
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    screen.approval_selected,
+                    ApprovalChoice::Feedback,
+                    "unsupported session approval is skipped"
+                );
+                screen.pending.as_mut().unwrap().session_scope = scope;
+                screen.select_approval(ApprovalChoice::Approve);
+            }
+            for key in keys {
+                key_action(&handle, &mut screen, KeyEvent::new(key, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            assert!(screen.pending.is_none());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap().kind,
+                        EventKind::RunFinished { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(workspace.path().join("decision.txt").exists(), approved);
+            assert_eq!(
+                handle.snapshot().await.unwrap().policy.accept_edits,
+                session
+            );
+            assert_eq!(screen.draft(), "saved draft");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_feedback_preserves_the_draft_and_rejects_invalid_input_before_reply() {
+        use ratatui_textarea::CursorMove;
+        let (handle, workspace, _data) = exit_fixture().await;
+        let mut events = handle.attach().await.unwrap().events;
+        handle
+            .run_tool(
+                "apply_patch",
+                serde_json::json!({"path":"rejected.txt", "content":"must not be written"}),
+            )
+            .await
+            .unwrap();
+        let mut screen = test_screen();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while screen.pending.is_none() {
+                apply_event(&handle, &mut screen, events.recv().await.unwrap())
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        screen.set_draft("original draft\n世界");
+        screen.editor.move_cursor(CursorMove::Top);
+        screen.editor.move_cursor(CursorMove::Head);
+        screen.editor.start_selection();
+        screen.editor.move_cursor(CursorMove::End);
+        let cursor = screen.editor.cursor();
+        let selection = screen.editor.selection_range();
+        for _ in 0..2 {
+            key_action(
+                &handle,
+                &mut screen,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(screen.approval_selected, ApprovalChoice::Feedback);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(buffer_row(terminal.backend(), 20).contains("1 Approve once"));
+        assert!(buffer_row(terminal.backend(), 21).contains("2 Approve for this session"));
+        assert!(
+            buffer_row(terminal.backend(), 22).contains("3 Tell Bund what to do differently"),
+            "{}",
+            buffer_row(terminal.backend(), 22)
+        );
+        assert_eq!(terminal.backend().buffer()[(6, 22)].fg, Color::DarkGray);
+        screen.paste("use option ");
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
+        assert!(
+            screen.pending.is_some(),
+            "digits in guidance must not approve"
+        );
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(screen.approval_selected, ApprovalChoice::Session);
+        screen.paste("ignored while on session approval");
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(screen.approval_selected, ApprovalChoice::Session);
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(screen.approval_selected, ApprovalChoice::Feedback);
+        assert!(
+            screen.pending.is_some(),
+            "Esc from guidance returns to the menu"
+        );
+        screen.approval_feedback = None;
+        screen.start_approval_feedback();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(key_action(&handle, &mut screen, enter).await.is_err());
+        screen.paste(&"x".repeat(bund_core::MAX_APPROVAL_FEEDBACK_BYTES + 1));
+        assert!(key_action(&handle, &mut screen, enter).await.is_err());
+        assert!(screen.pending.is_some());
+        screen.approval_feedback = None;
+        screen.start_approval_feedback();
+        let guidance = "Inspect the existing file instead; do not create a new one.";
+        screen.paste(guidance);
+        key_action(&handle, &mut screen, enter).await.unwrap();
+        assert!(screen.pending.is_none());
+        assert!(screen.approval_feedback.is_none());
+        assert_eq!(screen.draft(), "original draft\n世界");
+        assert_eq!(screen.editor.cursor(), cursor);
+        assert_eq!(screen.editor.selection_range(), selection);
+        let mut recorded_feedback = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let EventKind::ApprovalResolved {
+                    decision: ApprovalDecision::DenyWithFeedback { feedback },
+                    ..
+                } = &event.kind
+                {
+                    assert_eq!(feedback, guidance);
+                    recorded_feedback = true;
+                }
+                if matches!(event.kind, EventKind::RunFinished { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(recorded_feedback);
+        assert!(!workspace.path().join("rejected.txt").exists());
+        let mut idle = test_screen();
+        key_action(
+            &handle,
+            &mut idle,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(idle.draft(), "2", "numbers type normally outside approval");
+    }
+
+    #[test]
+    fn fullscreen_geometry_preserves_top_information_bottom_draft_and_approval() {
         let mut screen = test_screen();
         screen.set_draft("Keep this draft\nsecond line");
-        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
-        terminal.draw(|frame| screen.render(frame)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), "╭");
-        assert_eq!(terminal.backend().buffer()[(79, 7)].symbol(), "╯");
-        assert!(buffer_row(terminal.backend(), 4).contains("Keep this draft"));
+        for (width, height) in [(80, 24), (50, 16), (100, 30), (24, 8), (8, 2), (1, 1)] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let (_, _, _, composer) = regions(Rect::new(0, 0, width, height), false);
+            assert_eq!(composer.bottom(), height);
+            assert_eq!(screen.draft(), "Keep this draft\nsecond line");
+            if height >= 16 {
+                assert!(buffer_row(terminal.backend(), 0).contains("Bund"));
+                assert!(buffer_row(terminal.backend(), 1).contains("fixture-model"));
+                assert_eq!(terminal.backend().buffer()[(0, height - 5)].symbol(), "╭");
+                assert_eq!(
+                    terminal.backend().buffer()[(width - 1, height - 1)].symbol(),
+                    "╯"
+                );
+                assert!(buffer_row(terminal.backend(), height - 4).contains("Keep this draft"));
+            }
+        }
         screen.pending = Some(ApprovalRequest {
             id: "approval".into(),
             run_id: "run".into(),
@@ -930,51 +2411,339 @@ mod tests {
                 name: "apply_patch".into(),
                 arguments: serde_json::json!({}),
             },
-            preview: "review patch".into(),
+            preview: "exact proposed patch".into(),
             fingerprint: "fixture".into(),
             workspace: PathBuf::from("."),
+            session_scope: Some(bund_core::SessionApprovalScope::WorkspaceEdits),
         });
-        terminal.draw(|frame| screen.render(frame)).unwrap();
-        assert!(buffer_row(terminal.backend(), 0).contains("Approval required"));
-        assert!(buffer_row(terminal.backend(), 3).contains("draft paused"));
-        assert!(buffer_row(terminal.backend(), 4).contains("Keep this draft"));
-        assert!(buffer_row(terminal.backend(), 5).contains("second line"));
-        assert_eq!(terminal.backend().buffer()[(79, 7)].symbol(), "╯");
+        for (width, height) in [
+            (80, 24),
+            (50, 16),
+            (100, 30),
+            (40, 8),
+            (40, 1),
+            (80, 4),
+            (80, 3),
+            (80, 2),
+            (80, 1),
+        ] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let (header, approval, preview, composer) =
+                regions(Rect::new(0, 0, width, height), true);
+            assert_eq!(header.bottom(), preview.y);
+            assert_eq!(preview.bottom(), approval.y);
+            assert_eq!(approval.bottom(), composer.y);
+            assert_eq!(approval.height, 0);
+            assert_eq!(composer.bottom(), height);
+            let controls = (composer.y..composer.bottom())
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let labels = if height == 1 {
+                ["1 Once", "2 Session", "3 Give instructions"]
+            } else if height == 2 {
+                ["1 Once", "2 Session", "3 Tell Bund what to do differently"]
+            } else {
+                [
+                    "1 Approve once",
+                    "2 Approve for this session",
+                    "3 Tell Bund what to do differently",
+                ]
+            };
+            for label in labels {
+                assert!(controls.contains(label), "{width}x{height}: {controls}");
+            }
+            assert_eq!(screen.draft(), "Keep this draft\nsecond line");
+            if height >= 16 {
+                assert!(
+                    buffer_row(terminal.backend(), composer.y).contains("Approval: apply_patch")
+                );
+                assert!(
+                    buffer_row(terminal.backend(), preview.y + 1).contains("exact proposed patch")
+                );
+                assert!(buffer_row(terminal.backend(), composer.y).contains("draft saved"));
+                assert!(!controls.contains("Keep this draft"));
+                assert_eq!(terminal.backend().buffer()[(0, composer.y)].fg, Color::Cyan);
+            }
+            assert!(!screen.confirm_exit_at(Instant::now()));
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let visible = (0..height)
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                visible.contains(EXIT_CONFIRM),
+                "{width}x{height}: {visible}"
+            );
+            screen.reset_exit_confirmation();
+        }
     }
 
     #[test]
-    fn bottom_anchor_survives_resize_and_tiny_terminals_keep_editing_space() {
-        let mut terminal = Terminal::with_options(
-            TestBackend::new(80, 24),
-            TerminalOptions {
-                viewport: Viewport::Inline(9),
-            },
-        )
-        .unwrap();
-        for (width, height) in [(80, 24), (50, 16), (100, 30), (8, 2), (1, 1), (80, 24)] {
-            terminal.backend_mut().resize(width, height);
-            pin_to_bottom(&mut terminal).unwrap();
-            assert_eq!(terminal.get_frame().area().bottom(), height);
-            assert!(terminal.get_frame().area().height <= 9);
-        }
-        let mut screen = test_screen();
-        screen.set_draft("x");
-        for (width, height) in [(1, 1), (2, 1), (8, 2), (10, 3), (20, 4), (30, 5)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| screen.render(frame)).unwrap();
-            if width >= 3 {
-                assert!(
-                    terminal
-                        .backend()
-                        .buffer()
-                        .content
-                        .iter()
-                        .any(|cell| cell.symbol() == "x"),
-                    "draft hidden in {width}x{height}"
-                );
+    fn approval_choices_use_the_composer_without_an_extra_strip() {
+        for height in 0..=40 {
+            for width in [1, 8, 24, 80] {
+                let area = Rect::new(2, 3, width, height);
+                let (header, approval, preview, composer) = regions(area, true);
+                assert_eq!(header.y, area.y);
+                assert_eq!(header.bottom(), preview.y);
+                assert_eq!(preview.bottom(), approval.y);
+                assert_eq!(approval.bottom(), composer.y);
+                assert_eq!(composer.bottom(), area.bottom());
+                assert_eq!(approval.height, 0);
+                if height > 0 {
+                    assert!(composer.height > 0);
+                }
             }
-            assert_eq!(screen.draft(), "x");
         }
+    }
+
+    #[test]
+    fn resizing_short_draft_preserves_cursor_and_selection() {
+        use ratatui_textarea::CursorMove;
+        let mut screen = test_screen();
+        screen.set_draft("first\nsecond");
+        screen.editor.move_cursor(CursorMove::Top);
+        screen.editor.move_cursor(CursorMove::Head);
+        screen.editor.start_selection();
+        screen.editor.move_cursor(CursorMove::Bottom);
+        screen.editor.move_cursor(CursorMove::End);
+        let cursor = screen.editor.cursor();
+        let selection = screen.editor.selection_range();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(50, 8)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        terminal.backend_mut().resize(50, 24);
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(buffer_row(terminal.backend(), 20).contains("first"));
+        assert!(buffer_row(terminal.backend(), 21).contains("second"));
+        assert_eq!(screen.editor.cursor(), cursor);
+        assert_eq!(screen.editor.selection_range(), selection);
+    }
+
+    fn event(screen: &mut Screen, kind: EventKind) {
+        screen.transcript.apply(&SessionEvent {
+            version: 1,
+            session_id: "fixture".into(),
+            sequence: screen.transcript.cursor() + 1,
+            run_id: Some("run".into()),
+            kind,
+        });
+        screen.document_dirty = true;
+    }
+
+    #[test]
+    fn messages_have_speaker_dots_indented_bodies_and_blank_separation() {
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "Query\nnext query line".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::RunOutput {
+                response_id: None,
+                text: "**Answer**\nnext response line".into(),
+            },
+        );
+        let document = screen.build_document(80);
+        let lines = document
+            .rows
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(lines[0], "● Query");
+        assert_eq!(lines[1], "  next query line");
+        assert!(lines[2].trim().is_empty());
+        assert_eq!(lines[3], "● Answer");
+        assert_eq!(lines[4], "  next response line");
+        assert_eq!(
+            document.rows[0].line.spans[0].style.fg,
+            Some(render::QUERY_BLUE)
+        );
+        assert_eq!(document.rows[3].line.spans[0].style.fg, Some(Color::Gray));
+        assert!(lines[5].contains("Activity"));
+        for width in [4, 12, 30] {
+            assert!(screen
+                .build_document(width)
+                .rows
+                .iter()
+                .all(|row| row.line.width() <= width));
+        }
+    }
+
+    #[tokio::test]
+    async fn mouse_selection_freezes_visible_response_and_preserves_the_draft() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "inspect".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: "Selected 世界 e\u{301}".into(),
+            },
+        );
+        screen.set_draft("keep my draft");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        let row = (0..24)
+            .find(|&row| buffer_row(terminal.backend(), row).contains("Selected"))
+            .unwrap();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        mouse_action(
+            &handle,
+            &mut screen,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+        )
+        .await
+        .unwrap();
+        mouse_action(
+            &handle,
+            &mut screen,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 79, row),
+        )
+        .await
+        .unwrap();
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: " later streaming text".into(),
+            },
+        );
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(!buffer_row(terminal.backend(), row).contains("later streaming"));
+        assert_ne!(terminal.backend().buffer()[(2, row)].bg, Color::Reset);
+        // Complete selection directly so this test never touches the host clipboard.
+        assert_eq!(
+            screen.selection.finish().as_deref(),
+            Some("Selected 世界 e\u{301}")
+        );
+        assert_eq!(screen.draft(), "keep my draft");
+        assert!(!screen.follow);
+        terminal.backend_mut().resize(50, 24);
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(
+            !screen.selection.is_active(),
+            "resize must clear stale cell coordinates"
+        );
+        assert_eq!(screen.draft(), "keep my draft");
+    }
+
+    #[test]
+    fn collapsed_activity_hides_details_and_final_replaces_provisional_text() {
+        use bund_core::ResponsePurpose;
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "inspect".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::ResponseStarted {
+                id: "response".into(),
+                purpose: ResponsePurpose::Conversation,
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::ResponseTextDelta {
+                id: "response".into(),
+                text: "partial response".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::ResponseCompleted {
+                id: "response".into(),
+                purpose: ResponsePurpose::Conversation,
+                text: "Authoritative answer".into(),
+                reasoning: vec!["private provider summary".into()],
+                tool_calls: vec![],
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::RunOutput {
+                response_id: Some("response".into()),
+                text: "Authoritative answer".into(),
+            },
+        );
+        let text = |screen: &Screen| {
+            screen
+                .build_document(80)
+                .rows
+                .iter()
+                .map(|row| row.line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!text(&screen).contains("private provider summary"));
+        assert!(!text(&screen).contains("partial response"));
+        assert_eq!(text(&screen).matches("Authoritative answer").count(), 1);
+        screen.expanded = true;
+        assert!(text(&screen).contains("Reasoning summary"));
+        assert!(text(&screen).contains("private provider summary"));
+        assert_eq!(text(&screen).matches("Authoritative answer").count(), 1);
+    }
+
+    #[test]
+    fn scroll_anchor_survives_streaming_resize_and_expansion() {
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "inspect".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: (0..80).map(|n| format!("line {n}\n")).collect(),
+            },
+        );
+        screen.set_draft("persistent draft");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        screen.move_rows(false, screen.viewport_height.saturating_sub(1).max(1));
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        let anchor = screen.anchor.clone().unwrap();
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: "latest line\n".into(),
+            },
+        );
+        screen.expanded = true;
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert_eq!(screen.anchor, Some(anchor.clone()));
+        terminal.backend_mut().resize(50, 18);
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert_eq!(screen.anchor.as_ref().unwrap().section, anchor.section);
+        assert_eq!(screen.draft(), "persistent draft");
+        screen.follow = true;
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert_eq!(
+            screen.top,
+            screen
+                .document
+                .rows
+                .len()
+                .saturating_sub(screen.viewport_height)
+        );
     }
 
     #[test]
@@ -983,10 +2752,19 @@ mod tests {
             mode: Mode::Act,
             accept_edits: true,
             allowed_commands: vec!["cargo test".into()],
+            ..Policy::default()
         };
         assert_eq!(
             policy_status(&policy),
             "Act · edits auto · shell reviewed (1 exact grants)"
+        );
+        policy.session_commands.push(bund_core::CommandGrant {
+            command: "cargo check".into(),
+            cwd: "crate".into(),
+        });
+        assert_eq!(
+            policy_status(&policy),
+            "Act · edits auto · shell reviewed (2 exact grants)"
         );
         policy.mode = Mode::Plan;
         assert_eq!(
@@ -996,33 +2774,38 @@ mod tests {
         policy.mode = Mode::Act;
         policy.accept_edits = false;
         policy.allowed_commands.clear();
+        policy.session_commands.clear();
         assert_eq!(
             policy_status(&policy),
             "Act · edits reviewed · shell reviewed"
         );
     }
     #[test]
-    fn regular_typing_cannot_accidentally_approve() {
+    fn approval_choices_accept_numbers_and_legacy_shortcuts_only_on_press() {
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
-            Some(ApprovalDecision::ApproveOnce)
+            Some(ApprovalChoice::Approve)
         );
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(ApprovalDecision::Deny)
+            None
         );
-    }
-    #[test]
-    fn wide_unicode_and_combining_marks_wrap_without_splitting() {
-        assert_eq!(wrap_lines("ab世界e\u{301}", 4), ["ab世", "界e\u{301}"]);
-        assert_eq!(wrap_lines("\n", 4), ["", ""]);
-        assert!(wrap_lines("世界", 1)
-            .iter()
-            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 1));
+        for (number, choice) in [
+            ('1', ApprovalChoice::Approve),
+            ('2', ApprovalChoice::Session),
+            ('3', ApprovalChoice::Feedback),
+        ] {
+            let mut key = KeyEvent::new(KeyCode::Char(number), KeyModifiers::NONE);
+            assert_eq!(approval_key(key), Some(choice));
+            key.kind = crossterm::event::KeyEventKind::Repeat;
+            assert_eq!(approval_key(key), None);
+            key.kind = crossterm::event::KeyEventKind::Release;
+            assert_eq!(approval_key(key), None);
+        }
     }
     #[test]
     fn history_restores_draft_and_keeps_multiline_prompts() {

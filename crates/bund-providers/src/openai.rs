@@ -112,7 +112,7 @@ fn request_body(request: &ProviderRequest) -> Result<Value> {
         "tools":tools, "stream":true, "store":false, "include":["reasoning.encrypted_content"],
         "parallel_tool_calls":false, "max_output_tokens":request.profile.max_output_tokens});
     if let Some(effort) = &request.profile.reasoning {
-        body["reasoning"] = json!({"effort":effort});
+        body["reasoning"] = json!({"effort":effort, "summary":"auto"});
     }
     Ok(body)
 }
@@ -261,6 +261,7 @@ impl State {
             .as_array()
             .ok_or_else(|| protocol("invalid response output"))?;
         let mut text = String::new();
+        let mut reasoning = Vec::new();
         let mut calls = Vec::new();
         for item in output {
             match required_str(item, "type")? {
@@ -304,7 +305,23 @@ impl State {
                             .map_err(|_| protocol("invalid function-call JSON arguments"))?,
                     });
                 }
-                "reasoning" => {} // Preserved, never flattened into visible assistant text.
+                "reasoning" => {
+                    for part in item["summary"]
+                        .as_array()
+                        .ok_or_else(|| protocol("invalid reasoning summary array"))?
+                    {
+                        if required_str(part, "type")? != "summary_text" {
+                            return Err(protocol("unsupported reasoning summary content"));
+                        }
+                        let summary = part["text"]
+                            .as_str()
+                            .ok_or_else(|| protocol("invalid reasoning summary text"))?;
+                        if !summary.trim().is_empty() {
+                            reasoning.push(summary.to_owned());
+                        }
+                    }
+                    // encrypted_content is preserved only inside continuation.
+                }
                 _ => {
                     return Err(failure(
                         ProviderErrorKind::Unsupported,
@@ -330,6 +347,7 @@ impl State {
         }
         Ok(ProviderResponse {
             text,
+            reasoning,
             tool_calls: calls,
             continuation: Some(continuation(&request.profile, output)?),
             usage: Usage {

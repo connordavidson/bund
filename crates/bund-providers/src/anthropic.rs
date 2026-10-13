@@ -120,7 +120,7 @@ fn request_body(request: &ProviderRequest) -> Result<Value> {
     if let Some(effort) = &request.profile.reasoning {
         // The model profile opts into adaptive thinking; legacy budget-based
         // thinking requires a future explicit capability rather than guessing.
-        body["thinking"] = json!({"type":"adaptive"});
+        body["thinking"] = json!({"type":"adaptive", "display":"summarized"});
         body["output_config"] = json!({"effort":effort});
     }
     Ok(body)
@@ -350,6 +350,7 @@ impl State {
         }
         let content: Vec<Value> = self.blocks.into_values().map(|block| block.value).collect();
         let mut text = String::new();
+        let mut reasoning = Vec::new();
         let mut calls = Vec::new();
         for block in &content {
             match required_str(block, "type")? {
@@ -365,6 +366,12 @@ impl State {
                 }),
                 "thinking" => {
                     required_str(block, "signature")?;
+                    let summary = block["thinking"]
+                        .as_str()
+                        .ok_or_else(|| protocol("invalid thinking summary text"))?;
+                    if !summary.trim().is_empty() {
+                        reasoning.push(summary.to_owned());
+                    }
                 }
                 "redacted_thinking" => {
                     required_str(block, "data")?;
@@ -385,6 +392,7 @@ impl State {
             .ok_or_else(|| protocol("invalid or overflowing input token usage"))?;
         Ok(ProviderResponse {
             text,
+            reasoning,
             tool_calls: calls,
             continuation: Some(continuation(&request.profile, &content)?),
             usage: Usage {
