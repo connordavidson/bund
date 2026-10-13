@@ -8,15 +8,17 @@ use bund_core::{
     SessionHandle, SessionSnapshot,
 };
 use crossterm::{
+    cursor::MoveTo,
     event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
 };
 use ratatui::{
-    layout::{Constraint, Layout},
+    backend::Backend,
+    layout::Rect,
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Frame, TerminalOptions, Viewport,
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use ratatui_textarea::TextArea;
 use std::{
@@ -84,64 +86,117 @@ impl Screen {
         self.editor
             .set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
         self.editor
+            .set_placeholder_text("Ask bund about this workspace…");
+        self.editor
             .move_cursor(ratatui_textarea::CursorMove::Bottom);
         self.editor.move_cursor(ratatui_textarea::CursorMove::End);
     }
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-        let regions = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        let tail_rows = wrap_lines(&self.tail, area.width as usize);
-        let tail = tail_rows
-            .into_iter()
-            .rev()
-            .take(2)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), regions[0]);
+        let (info, composer, footer) = composer_regions(area);
         let model = if self.snapshot.profile.model.is_empty() {
             "model not configured"
         } else {
             &self.snapshot.profile.model
         };
         let status = format!(
-            "{:?} · {}\n{} / {} · {} tokens",
+            "{:?} · {}\n{} / {} · {} tokens\n{}",
             self.snapshot.status,
             policy_status(&self.snapshot.policy),
             self.snapshot.profile.provider,
             model,
-            self.snapshot.usage.input_tokens + self.snapshot.usage.output_tokens
-        );
-        frame.render_widget(
-            Paragraph::new(clean(&status)).style(Style::default().fg(Color::Cyan)),
-            regions[1],
+            self.snapshot.usage.input_tokens + self.snapshot.usage.output_tokens,
+            wrap_lines(&self.tail, area.width as usize)
+                .last()
+                .cloned()
+                .unwrap_or_default()
         );
         if let Some(pending) = &self.pending {
-            let prompt = format!("Permission: {}\nCtrl+Y: approve once  Ctrl+N / Esc: deny\nYour draft is preserved.", clean(&pending.tool_call.name));
+            let prompt = format!("Approval required: {}\nCtrl+Y: approve once  Ctrl+N / Esc: deny\nYour draft is preserved.", clean(&pending.tool_call.name));
             frame.render_widget(
-                Paragraph::new(prompt).wrap(Wrap { trim: false }).block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .title("Approval required"),
-                ),
-                regions[2],
+                Paragraph::new(prompt).style(Style::default().fg(Color::Yellow)),
+                info,
             );
         } else {
-            frame.render_widget(&self.editor, regions[2]);
+            frame.render_widget(
+                Paragraph::new(clean(&status)).style(Style::default().fg(Color::Cyan)),
+                info,
+            );
         }
+        let borders = if composer.width < 3 {
+            Borders::NONE
+        } else if composer.height < 3 {
+            Borders::LEFT | Borders::RIGHT
+        } else {
+            Borders::ALL
+        };
+        let mut block = Block::default()
+            .borders(borders)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(if self.pending.is_some() {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            }));
+        if composer.height >= 3 && composer.width >= 3 {
+            block = block.title(if self.pending.is_some() {
+                " Ask bund · draft paused "
+            } else {
+                " Ask bund "
+            });
+        }
+        let input = block.inner(composer);
+        frame.render_widget(block, composer);
+        // Approval only pauses editing. It never replaces or hides the draft.
+        frame.render_widget(&self.editor, input);
+        let hint = if self.pending.is_some() {
+            "Ctrl+Y approve once · Ctrl+N / Esc deny · draft paused"
+        } else {
+            &self.hint
+        };
         frame.render_widget(
-            Paragraph::new(clean(&self.hint)).style(Style::default().fg(Color::DarkGray)),
-            regions[3],
+            Paragraph::new(clean(hint)).style(Style::default().fg(Color::DarkGray)),
+            footer,
         );
     }
+}
+
+fn composer_regions(area: Rect) -> (Rect, Rect, Rect) {
+    // Always reserve actual editing space first. Tiny terminals progressively
+    // omit status and footer, rather than allocating an invisible textarea.
+    let footer = u16::from(area.height >= 4);
+    let info = if area.height >= 8 {
+        3
+    } else if area.height >= 5 {
+        1
+    } else {
+        0
+    };
+    let composer = area.height.saturating_sub(info + footer);
+    (
+        Rect::new(area.x, area.y, area.width, info),
+        Rect::new(area.x, area.y + info, area.width, composer),
+        Rect::new(
+            area.x,
+            area.bottom().saturating_sub(footer),
+            area.width,
+            footer,
+        ),
+    )
+}
+
+fn pin_to_bottom<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    let viewport = terminal.get_frame().area();
+    let gap = size.height.saturating_sub(viewport.bottom());
+    if gap > 0 {
+        // Inline resize can place the viewport above the bottom (and a width
+        // shrink deliberately resets its origin). Padding through insert_before
+        // reanchors it using Ratatui's existing primary-screen scrollback path.
+        terminal.insert_before(gap, |_| {})?;
+    }
+    Ok(())
 }
 
 fn policy_status(policy: &Policy) -> String {
@@ -203,10 +258,14 @@ async fn run_inner(
     let mut cursor = attachment.snapshot.cursor;
     let history = History::load(history_path)?;
     let mut screen = Screen::new(attachment.snapshot, history);
+    let _guard = TerminalGuard;
+    let (_, rows) = crossterm::terminal::size()?;
+    // Moving, then allowing Inline to append its own lines, preserves existing
+    // terminal contents in native scrollback while anchoring the initial box.
+    execute!(std::io::stdout(), MoveTo(0, rows.saturating_sub(1)))?;
     let mut terminal = ratatui::init_with_options(TerminalOptions {
         viewport: Viewport::Inline(9),
     });
-    let _guard = TerminalGuard;
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     insert(&mut terminal, &format!("bund · session {}\nWorkspace: {}\n/help for commands. Application permissions do not sandbox shell commands.", screen.snapshot.id, screen.snapshot.workspace.display()))?;
     for message in &screen.snapshot.messages {
@@ -270,7 +329,7 @@ async fn run_inner(
                         _ => {},
                     }
                 }
-                if dirty { terminal.draw(|frame| screen.render(frame))?; dirty = false; }
+                if dirty { pin_to_bottom(&mut terminal)?; terminal.draw(|frame| screen.render(frame))?; dirty = false; }
             },
             received = events.recv() => match received {
                 Ok(event) => { process_event(&handle, &mut screen, &mut terminal, event, &mut cursor).await?; dirty = true; },
@@ -689,6 +748,7 @@ fn complete(screen: &mut Screen) {
 }
 
 fn insert(terminal: &mut ratatui::DefaultTerminal, text: &str) -> Result<()> {
+    pin_to_bottom(terminal)?;
     let width = terminal.size()?.width.max(1) as usize;
     let lines = wrap_lines(&clean(text), width);
     for chunk in lines.chunks(200) {
@@ -819,6 +879,104 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn test_screen() -> Screen {
+        let snapshot = SessionSnapshot {
+            policy: Policy::default(),
+            id: "fixture".into(),
+            workspace: PathBuf::from("."),
+            profile: bund_core::ModelProfile::new("openai", "fixture-model"),
+            status: RunStatus::Idle,
+            mode: Mode::Act,
+            cursor: 0,
+            run_id: None,
+            pending_approval: None,
+            messages: vec![],
+            usage: bund_core::Usage::default(),
+            validation: bund_core::ValidationStatus::NotRun,
+        };
+        Screen::new(
+            snapshot,
+            History {
+                path: PathBuf::new(),
+                entries: vec![],
+                position: None,
+                draft: String::new(),
+            },
+        )
+    }
+
+    fn buffer_row(backend: &TestBackend, row: u16) -> String {
+        (0..backend.buffer().area.width)
+            .map(|col| backend.buffer()[(col, row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn composer_stays_visible_when_approval_pauses_editing() {
+        let mut screen = test_screen();
+        screen.set_draft("Keep this draft\nsecond line");
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), "╭");
+        assert_eq!(terminal.backend().buffer()[(79, 7)].symbol(), "╯");
+        assert!(buffer_row(terminal.backend(), 4).contains("Keep this draft"));
+        screen.pending = Some(ApprovalRequest {
+            id: "approval".into(),
+            run_id: "run".into(),
+            tool_call: bund_core::ToolCall {
+                id: "call".into(),
+                name: "apply_patch".into(),
+                arguments: serde_json::json!({}),
+            },
+            preview: "review patch".into(),
+            fingerprint: "fixture".into(),
+            workspace: PathBuf::from("."),
+        });
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(buffer_row(terminal.backend(), 0).contains("Approval required"));
+        assert!(buffer_row(terminal.backend(), 3).contains("draft paused"));
+        assert!(buffer_row(terminal.backend(), 4).contains("Keep this draft"));
+        assert!(buffer_row(terminal.backend(), 5).contains("second line"));
+        assert_eq!(terminal.backend().buffer()[(79, 7)].symbol(), "╯");
+    }
+
+    #[test]
+    fn bottom_anchor_survives_resize_and_tiny_terminals_keep_editing_space() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(9),
+            },
+        )
+        .unwrap();
+        for (width, height) in [(80, 24), (50, 16), (100, 30), (8, 2), (1, 1), (80, 24)] {
+            terminal.backend_mut().resize(width, height);
+            pin_to_bottom(&mut terminal).unwrap();
+            assert_eq!(terminal.get_frame().area().bottom(), height);
+            assert!(terminal.get_frame().area().height <= 9);
+        }
+        let mut screen = test_screen();
+        screen.set_draft("x");
+        for (width, height) in [(1, 1), (2, 1), (8, 2), (10, 3), (20, 4), (30, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            if width >= 3 {
+                assert!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .any(|cell| cell.symbol() == "x"),
+                    "draft hidden in {width}x{height}"
+                );
+            }
+            assert_eq!(screen.draft(), "x");
+        }
+    }
+
     #[test]
     fn policy_status_uses_saved_grants_and_plan_restrictions() {
         let mut policy = Policy {

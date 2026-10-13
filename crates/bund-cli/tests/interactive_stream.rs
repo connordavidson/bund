@@ -183,7 +183,7 @@ struct Pty {
     child: Child,
     before: Termios,
     received: Vec<u8>,
-    cursor_scan: usize,
+    screen: vt100::Parser,
 }
 
 impl Pty {
@@ -210,7 +210,7 @@ impl Pty {
         command
             .args([
                 "-c",
-                "\"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
+                "printf 'PREEXISTING_SCROLLBACK\\n'; \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
                 "bund-pty-wrapper",
             ])
             .arg(env!("CARGO_BIN_EXE_bund"))
@@ -227,7 +227,6 @@ impl Pty {
                 "fixture-model",
                 "--endpoint",
                 endpoint,
-                "begin fixture",
             ])
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "fixture-only-key")
@@ -258,7 +257,7 @@ impl Pty {
             child,
             before,
             received: Vec::new(),
-            cursor_scan: 0,
+            screen: vt100::Parser::new(24, 90, 1000),
         }
     }
 
@@ -269,18 +268,19 @@ impl Pty {
     fn pump(&mut self) {
         let mut buffer = [0; 8192];
         match self.master.read(&mut buffer) {
-            Ok(n) => self.received.extend_from_slice(&buffer[..n]),
+            Ok(n) => {
+                for byte in &buffer[..n] {
+                    self.received.push(*byte);
+                    self.screen.process(&[*byte]);
+                    if self.received.ends_with(b"\x1b[6n") {
+                        let (row, col) = self.screen.screen().cursor_position();
+                        self.send(&format!("\x1b[{};{}R", row + 1, col + 1));
+                    }
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => {}
             Err(error) => panic!("PTY read: {error}"),
-        }
-        while self.cursor_scan + 4 <= self.received.len() {
-            if &self.received[self.cursor_scan..self.cursor_scan + 4] == b"\x1b[6n" {
-                self.send("\x1b[1;1R");
-                self.cursor_scan += 4;
-            } else {
-                self.cursor_scan += 1;
-            }
         }
     }
 
@@ -310,16 +310,57 @@ impl Pty {
         }
     }
 
-    fn resize(&mut self) {
+    fn resize(&mut self, rows: u16, cols: u16) {
         let size = Winsize {
-            ws_row: 18,
-            ws_col: 62,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
         let result =
             unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &size) };
         assert_eq!(result, 0);
+        self.screen.screen_mut().set_size(rows, cols);
+    }
+
+    fn wait_composer(&mut self, draft: Option<&str>, approval: bool) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.pump();
+            let screen = self.screen.screen();
+            let (rows, cols) = screen.size();
+            let contents = screen.contents();
+            // A 9-row inline viewport has a 5-row editor plus a 1-row footer.
+            // Check real rendered cells, not an ANSI-stripped byte transcript.
+            let top = rows - 6;
+            let bottom = rows - 2;
+            let bordered = screen.cell(top, 0).unwrap().contents() == "╭"
+                && screen.cell(bottom, 0).unwrap().contents() == "╰"
+                && screen.cell(bottom, cols - 1).unwrap().contents() == "╯";
+            let editor = screen
+                .rows(0, cols)
+                .skip(top as usize)
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let draft_visible =
+                draft.is_none_or(|text| text.lines().all(|line| editor.contains(line)));
+            let approval_visible = !approval
+                || (contents.contains("Approval required: apply_patch")
+                    && editor.contains("draft paused"));
+            if bordered && editor.contains("Ask bund") && draft_visible && approval_visible {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bottom composer missing or draft hidden (approval={approval}): {contents}"
+            );
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "bund exited unexpectedly: {contents}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn finish(&mut self) {
@@ -367,10 +408,19 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture();
     let mut terminal = Pty::spawn(dir.path(), &fixture.endpoint);
+    terminal.wait_composer(None, false);
+    let mut scrollback = terminal.screen.screen().clone();
+    scrollback.set_scrollback(1000);
+    assert!(
+        scrollback.contents().contains("PREEXISTING_SCROLLBACK"),
+        "launch must preserve existing terminal contents in native scrollback"
+    );
+    terminal.send("begin fixture\r");
     terminal.wait_text(0, "Streaming ready");
     fixture.requests.recv_timeout(WAIT).unwrap();
     terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
     terminal.wait_text(0, "keep this draft");
+    terminal.wait_composer(Some(DRAFT), false);
     terminal.send("\r");
     terminal.wait_text(0, "is active.");
     fixture.advance.send(()).unwrap();
@@ -378,9 +428,13 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     fixture.advance.send(()).unwrap();
     terminal.wait_text(0, "Approval required: apply_patch");
     terminal.wait_text(0, "Your draft is preserved.");
+    terminal.wait_composer(Some(DRAFT), true);
     let before_resize = terminal.received.len();
-    terminal.resize();
+    terminal.resize(18, 62);
     terminal.wait_text(before_resize, "Your draft is preserved.");
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.resize(30, 100);
+    terminal.wait_composer(Some(DRAFT), true);
     let before_deny = terminal.received.len();
     terminal.send("\x0e"); // Ctrl+N denies without touching the composer.
     terminal.wait_text(before_deny, "Denial acknowledged");

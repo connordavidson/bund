@@ -18,6 +18,10 @@ cargo build --release --locked -p bund-cli
 cargo install --path crates/bund-cli --locked
 ```
 
+Cargo installs `bund` into `~/.cargo/bin` by default. If that directory is not
+already on your shell's PATH, add `export PATH="$HOME/.cargo/bin:$PATH"` to your
+shell configuration. Confirm the installation with `bund --version`.
+
 Choose your actual API model ID; Bund does not guess which models your account
 can access. Supply credentials through your existing environment:
 
@@ -38,10 +42,21 @@ inspection. `bund` can open without credentials; configure a model before
 submitting a prompt. Subscription access to another coding product is not an
 API credential for Bund.
 
+Once your model is saved in the user configuration below and its API key is
+exported in your terminal, start Bund in any project with:
+
+```sh
+cd /path/to/project
+bund
+```
+
+The current directory becomes the workspace; no launcher script is required.
+
 ## Terminal workflow
 
-The interface stays on the primary terminal screen. Completed text remains in
-native scrollback after exit. Enter submits, Alt+Enter or Ctrl+J inserts a
+The interface stays on the primary terminal screen, with a bordered composer
+at the bottom that remains visible while work runs and approvals are pending.
+Completed text remains in native scrollback after exit. Enter submits, Alt+Enter or Ctrl+J inserts a
 newline, Tab completes slash commands and `@path` references, and Up/Down recalls
 history on a single-line draft. An `@path` identifies a file for the agent to
 read; it does not silently attach file contents.

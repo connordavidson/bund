@@ -31,3 +31,4 @@ unicode-width = "0.2"
 [dev-dependencies]
 tempfile.workspace = true
 nix.workspace = true
+vt100 = "0.16"
