@@ -17,7 +17,7 @@ use crossterm::{
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
@@ -53,12 +53,13 @@ const COMMANDS: &[&str] = &[
 const EXIT_WINDOW: Duration = Duration::from_millis(1500);
 const EXIT_CONFIRM: &str = "Press Ctrl+C again to exit";
 const EXIT_INSTRUCTION: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
-const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: 1 approves once; 2 denies; 3 Tell Bund what to do opens guidance. Enter sends guidance; Esc returns to choices. Ctrl+Y/Ctrl+N still approve/deny.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
+const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Up/Down chooses; Enter confirms. Arrow down to the gray Tell Bund what to do field and type guidance; Enter sends it. Up from its first line or Esc returns to choices without losing guidance. 1/2 approve/deny; 3 focuses guidance. Ctrl+Y/Ctrl+N still approve/deny from the choices.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
 
 /// One state owner keeps drafts independent from streaming and approval controls.
 struct Screen {
     editor: TextArea<'static>,
     approval_feedback: Option<TextArea<'static>>,
+    approval_selected: ApprovalChoice,
     snapshot: SessionSnapshot,
     pending: Option<ApprovalRequest>,
     transcript: Transcript,
@@ -383,6 +384,7 @@ impl Screen {
             snapshot,
             editor,
             approval_feedback: None,
+            approval_selected: ApprovalChoice::Approve,
             transcript: history_window(),
             expanded: false,
             follow: true,
@@ -408,19 +410,33 @@ impl Screen {
         self.editor.lines().join("\n")
     }
     fn paste(&mut self, text: &str) {
-        if let Some(editor) = &mut self.approval_feedback {
-            editor.insert_str(clean(text));
+        if self.pending.is_some() && self.approval_selected == ApprovalChoice::Feedback {
+            if let Some(editor) = &mut self.approval_feedback {
+                editor.insert_str(clean(text));
+            }
         } else if self.pending.is_none() {
             self.editor.insert_str(clean(text));
         }
     }
     fn start_approval_feedback(&mut self) {
-        let mut editor = TextArea::default();
-        editor.set_cursor_line_style(Style::default());
-        editor.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
-        editor.set_placeholder_text("Tell Bund what to do instead…");
-        self.approval_feedback = Some(editor);
+        self.approval_selected = ApprovalChoice::Feedback;
+        self.approval_feedback.get_or_insert_with(|| {
+            let mut editor = TextArea::default();
+            editor.set_cursor_line_style(Style::default());
+            editor.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
+            editor.set_placeholder_text("Tell Bund what to do");
+            editor.set_placeholder_style(Style::default().fg(Color::DarkGray));
+            editor
+        });
         self.hint = "Enter sends guidance · Alt+Enter newline · Esc returns to choices".into();
+    }
+    fn select_approval(&mut self, choice: ApprovalChoice) {
+        self.approval_selected = choice;
+        if choice == ApprovalChoice::Feedback {
+            self.start_approval_feedback();
+        } else {
+            self.hint = "↑/↓ choose · Enter confirm · 3 type guidance".into();
+        }
     }
     fn set_draft(&mut self, text: &str) {
         self.editor = TextArea::from(text.split('\n'));
@@ -612,8 +628,6 @@ impl Screen {
                 && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
             {
                 self.display_hint().to_owned()
-            } else if self.approval_feedback.is_some() {
-                " Tell Bund what to do · Enter send · Esc back ".into()
             } else if let Some(request) = &self.pending {
                 format!(
                     " Approval: {} · draft saved ",
@@ -626,20 +640,10 @@ impl Screen {
         }
         let input = block.inner(composer);
         frame.render_widget(block, composer);
-        if self.pending.is_some() && self.approval_feedback.is_none() {
-            let choices = if input.height >= 3 {
-                "1 Approve once\n2 Deny\n3 Tell Bund what to do"
-            } else if input.height == 2 {
-                "1 Approve once · 2 Deny\n3 Tell Bund what to do"
-            } else {
-                "1 Approve 2 Deny 3 Tell Bund what to do"
-            };
-            frame.render_widget(
-                Paragraph::new(choices).style(Style::default().fg(Color::Yellow)),
-                input,
-            );
+        if self.pending.is_some() {
+            self.render_approval(frame, input);
         } else {
-            let editor = self.approval_feedback.as_mut().unwrap_or(&mut self.editor);
+            let editor = &mut self.editor;
             frame.render_widget(&*editor, input);
             // The textarea retains its old scroll origin after a tiny window grows.
             // Once its new viewport is known, reveal a short draft in full. Scrolling
@@ -670,6 +674,108 @@ impl Screen {
                 Paragraph::new(clean(self.display_hint())).style(Style::default().fg(Color::Cyan)),
                 Rect::new(composer.x, composer.y, composer.width, 1),
             );
+        }
+    }
+    fn render_approval(&mut self, frame: &mut Frame, input: Rect) {
+        if input.is_empty() {
+            return;
+        }
+        let focused = self.approval_selected == ApprovalChoice::Feedback;
+        let action = |choice, text: &'static str| {
+            Span::styled(
+                text,
+                if self.approval_selected == choice {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )
+        };
+        let marker = |choice| {
+            if self.approval_selected == choice {
+                "› "
+            } else {
+                "  "
+            }
+        };
+        if input.height == 1 && !focused {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    action(ApprovalChoice::Approve, "1 Approve"),
+                    Span::raw(" "),
+                    action(ApprovalChoice::Deny, "2 Deny"),
+                    Span::styled(
+                        " 3 Tell Bund what to do",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])),
+                input,
+            );
+            return;
+        }
+        let actions = if input.height >= 3 {
+            vec![
+                Line::from(vec![
+                    Span::raw(marker(ApprovalChoice::Approve)),
+                    action(ApprovalChoice::Approve, "1 Approve once"),
+                ]),
+                Line::from(vec![
+                    Span::raw(marker(ApprovalChoice::Deny)),
+                    action(ApprovalChoice::Deny, "2 Deny"),
+                ]),
+            ]
+        } else if input.height == 2 {
+            vec![Line::from(vec![
+                action(ApprovalChoice::Approve, "1 Approve"),
+                Span::raw(" · "),
+                action(ApprovalChoice::Deny, "2 Deny"),
+            ])]
+        } else {
+            Vec::new()
+        };
+        let action_rows = actions.len() as u16;
+        frame.render_widget(
+            Paragraph::new(actions),
+            Rect::new(input.x, input.y, input.width, action_rows),
+        );
+        let field_row = input.bottom() - 1;
+        let prefix = format!("{}3 ", marker(ApprovalChoice::Feedback));
+        frame.render_widget(
+            Paragraph::new(prefix).style(Style::default().fg(if focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            })),
+            Rect::new(input.x, field_row, input.width.min(4), 1),
+        );
+        let field = Rect::new(
+            input.x + input.width.min(4),
+            field_row,
+            input.width.saturating_sub(4),
+            1,
+        );
+        if let Some(editor) = self
+            .approval_feedback
+            .as_mut()
+            .filter(|editor| !editor.is_empty())
+        {
+            editor.set_cursor_style(if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            });
+            frame.render_widget(&*editor, field);
+        } else {
+            frame.render_widget(
+                Paragraph::new("Tell Bund what to do").style(Style::default().fg(Color::DarkGray)),
+                field,
+            );
+            if focused && !field.is_empty() {
+                frame.buffer_mut()[(field.x, field.y)]
+                    .set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
         }
     }
     fn move_rows(&mut self, down: bool, step: usize) {
@@ -1279,11 +1385,12 @@ async fn apply_event(
         }
         EventKind::ApprovalRequired(request) => {
             screen.approval_feedback = None;
+            screen.approval_selected = ApprovalChoice::Approve;
             screen.selection.clear();
             screen.pending = Some(request);
             screen.approval_scroll = 0;
             screen.snapshot.status = RunStatus::AwaitingApproval;
-            screen.hint = "Choose 1 approve · 2 deny · 3 tell Bund what to do".into();
+            screen.hint = "↑/↓ choose · Enter confirm · 3 type guidance".into();
         }
         EventKind::ApprovalResolved { .. } => {
             screen.approval_feedback = None;
@@ -1408,11 +1515,20 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         _ => {}
     }
     if let Some(id) = screen.pending.as_ref().map(|request| request.id.clone()) {
-        if let Some(editor) = &mut screen.approval_feedback {
+        if key.kind != KeyEventKind::Press && key.code == KeyCode::Enter {
+            return Ok(false);
+        }
+        if screen.approval_selected == ApprovalChoice::Feedback {
+            let editor = screen
+                .approval_feedback
+                .as_mut()
+                .expect("focused guidance editor");
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => {
-                    screen.approval_feedback = None;
-                    screen.hint = "Choose 1 approve · 2 deny · 3 tell Bund what to do".into();
+                    screen.select_approval(ApprovalChoice::Deny);
+                }
+                (KeyCode::Up, mods) if mods.is_empty() && editor.cursor().0 == 0 => {
+                    screen.select_approval(ApprovalChoice::Deny);
                 }
                 (KeyCode::Enter, mods)
                     if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
@@ -1444,7 +1560,19 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
                     editor.input(key);
                 }
             }
-        } else if let Some(choice) = approval_key(key) {
+        } else if matches!(key.code, KeyCode::Up | KeyCode::Down) && key.modifiers.is_empty() {
+            let choice = match (screen.approval_selected, key.code) {
+                (ApprovalChoice::Approve, KeyCode::Down) => ApprovalChoice::Deny,
+                (ApprovalChoice::Deny, KeyCode::Down) => ApprovalChoice::Feedback,
+                (_, KeyCode::Up) => ApprovalChoice::Approve,
+                _ => screen.approval_selected,
+            };
+            screen.select_approval(choice);
+        } else if let Some(choice) = if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            Some(screen.approval_selected)
+        } else {
+            approval_key(key)
+        } {
             let decision = match choice {
                 ApprovalChoice::Approve => Some(ApprovalDecision::ApproveOnce),
                 ApprovalChoice::Deny => Some(ApprovalDecision::Deny),
@@ -1455,6 +1583,7 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
             };
             if let Some(decision) = decision {
                 handle.answer_approval(&id, decision).await?;
+                screen.approval_feedback = None;
                 screen.pending = None;
             }
         }
@@ -1979,8 +2108,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn numbered_choices_approve_or_deny_only_the_pending_action() {
-        for (choice, approved) in [('1', true), ('2', false)] {
+    async fn numbered_and_arrow_choices_approve_or_deny_only_the_pending_action() {
+        for (keys, approved) in [
+            (vec![KeyCode::Char('1')], true),
+            (vec![KeyCode::Char('2')], false),
+            (vec![KeyCode::Down, KeyCode::Up, KeyCode::Enter], true),
+            (vec![KeyCode::Down, KeyCode::Enter], false),
+        ] {
             let (handle, workspace, _data) = exit_fixture().await;
             let mut events = handle.attach().await.unwrap().events;
             handle
@@ -2001,13 +2135,11 @@ mod tests {
             .await
             .unwrap();
             screen.set_draft("saved draft");
-            key_action(
-                &handle,
-                &mut screen,
-                KeyEvent::new(KeyCode::Char(choice), KeyModifiers::NONE),
-            )
-            .await
-            .unwrap();
+            for key in keys {
+                key_action(&handle, &mut screen, KeyEvent::new(key, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
             assert!(screen.pending.is_none());
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -2055,13 +2187,26 @@ mod tests {
         screen.editor.move_cursor(CursorMove::End);
         let cursor = screen.editor.cursor();
         let selection = screen.editor.selection_range();
-        key_action(
-            &handle,
-            &mut screen,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
-        )
-        .await
-        .unwrap();
+        for _ in 0..2 {
+            key_action(
+                &handle,
+                &mut screen,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(screen.approval_selected, ApprovalChoice::Feedback);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(buffer_row(terminal.backend(), 20).contains("1 Approve once"));
+        assert!(buffer_row(terminal.backend(), 21).contains("2 Deny"));
+        assert!(
+            buffer_row(terminal.backend(), 22).contains("3 Tell Bund what to do"),
+            "{}",
+            buffer_row(terminal.backend(), 22)
+        );
+        assert_eq!(terminal.backend().buffer()[(6, 22)].fg, Color::DarkGray);
         screen.paste("use option ");
         key_action(
             &handle,
@@ -2081,21 +2226,47 @@ mod tests {
         key_action(
             &handle,
             &mut screen,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(screen.approval_selected, ApprovalChoice::Deny);
+        screen.paste("ignored while on Deny");
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
+        key_action(
+            &handle,
+            &mut screen,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         )
         .await
         .unwrap();
-        assert!(screen.approval_feedback.is_none());
+        assert_eq!(screen.approval_selected, ApprovalChoice::Deny);
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
         assert!(
             screen.pending.is_some(),
             "Esc from guidance returns to the menu"
         );
+        screen.approval_feedback = None;
         screen.start_approval_feedback();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(key_action(&handle, &mut screen, enter).await.is_err());
         screen.paste(&"x".repeat(bund_core::MAX_APPROVAL_FEEDBACK_BYTES + 1));
         assert!(key_action(&handle, &mut screen, enter).await.is_err());
         assert!(screen.pending.is_some());
+        screen.approval_feedback = None;
         screen.start_approval_feedback();
         let guidance = "Inspect the existing file instead; do not create a new one.";
         screen.paste(guidance);

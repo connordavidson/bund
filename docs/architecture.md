@@ -107,9 +107,12 @@ its own history navigation, and restores the original screen, mouse handling,
 and terminal modes on exit. Workspace, model, status, and keyboard hints
 stay at the top; the query box stays at the bottom. During approval, numbered
 choices replace the composer contents: 1 approves once, 2 denies, and the last
-option, 3 Tell Bund what to do, opens a separate guidance editor. The original
-draft, cursor, and selection remain intact. Enter sends guidance as a denied
-tool result for the next model request; Esc returns to the choices. A scrollable
+option is an inline field with a gray Tell Bund what to do placeholder. Up/Down
+selects choices; moving down to the field immediately accepts typing. Its editor
+is separate from the original draft, cursor, and selection. Enter confirms a
+selected action or sends guidance as a denied tool result for the next model
+request. Up from the field's first line or Esc returns to the choices while
+retaining guidance. A scrollable
 review preview remains between the header and query box. The composer survives
 streaming, expansion, resize, and approval requests. Interactive exit
 requires two consecutive Ctrl+C presses within 1.5 seconds. The first cancels

@@ -665,7 +665,7 @@ fn first_interrupt_cancels_pending_approval_without_closing_or_losing_draft() {
 }
 
 #[test]
-fn numbered_feedback_choice_sends_guidance_and_restores_original_draft() {
+fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft() {
     let dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -703,15 +703,80 @@ fn numbered_feedback_choice_sends_guidance_and_restores_original_draft() {
     terminal.wait_composer(Some(DRAFT), false);
     advance.send(()).unwrap();
     terminal.wait_composer(Some(DRAFT), true);
-    terminal.send("3");
-    terminal.wait_visible("Tell Bund what to do · Enter send");
-    terminal.send("temporary guidance");
-    terminal.send("\x1b");
-    terminal.wait_composer(Some(DRAFT), true);
-    terminal.send("3");
-    terminal.wait_visible("Tell Bund what to do · Enter send");
-    let guidance = "Use option 1: inspect 世界 instead.\nDo not create the file.";
-    terminal.send(&format!("\x1b[200~{guidance}\x1b[201~"));
+    let screen = terminal.screen.screen();
+    let (rows, cols) = screen.size();
+    assert!(screen
+        .rows(0, cols)
+        .nth((rows - 4) as usize)
+        .unwrap()
+        .contains("› 1 Approve once"));
+    let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+    let placeholder = third.find("Tell Bund what to do").unwrap();
+    let column = unicode_width::UnicodeWidthStr::width(&third[..placeholder]) as u16;
+    assert_eq!(
+        screen.cell(rows - 2, column).unwrap().fgcolor(),
+        vt100::Color::Idx(8)
+    );
+    terminal.send("\x1b[B");
+    terminal.wait_screen("Deny selected with Down", |screen| {
+        let (rows, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .nth((rows - 3) as usize)
+            .unwrap()
+            .contains("› 2 Deny")
+    });
+    terminal.send("\x1b[B"); // The next Down moves directly into the inline field.
+    terminal.wait_screen("last approval option focused", |screen| {
+        let (rows, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .nth((rows - 2) as usize)
+            .unwrap()
+            .contains("› 3 ")
+    });
+    let first = "Use option 1: inspect 世界.";
+    terminal.send(first); // Typing works immediately, without Enter or another mode switch.
+    terminal.wait_screen("guidance typed inline", |screen| {
+        let (rows, cols) = screen.size();
+        let choices = screen
+            .rows(0, cols)
+            .skip((rows - 4) as usize)
+            .take(3)
+            .collect::<Vec<_>>();
+        choices[0].contains("1 Approve once")
+            && choices[1].contains("2 Deny")
+            && choices[2].contains(first)
+            && !choices[2].contains("Tell Bund what to do")
+    });
+    terminal.send("\x1b[A"); // Up from the first guidance line selects Deny.
+    terminal.wait_screen("guidance retained while navigating to Deny", |screen| {
+        let (rows, cols) = screen.size();
+        let choices = screen
+            .rows(0, cols)
+            .skip((rows - 3) as usize)
+            .take(2)
+            .collect::<Vec<_>>();
+        choices[0].contains("› 2 Deny") && choices[1].contains(first)
+    });
+    terminal.send("\x1b[B");
+    terminal.wait_screen("guidance refocused after Down", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        third.contains("› 3 ") && third.contains(first)
+    });
+    terminal.send("\x1b"); // Esc also leaves the field without discarding its contents.
+    terminal.wait_screen("guidance retained after Escape", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        !third.contains("› 3 ") && third.contains(first)
+    });
+    terminal.send("3"); // The number shortcut focuses the same saved inline field.
+    terminal.wait_screen("guidance refocused by shortcut", |screen| {
+        let (rows, cols) = screen.size();
+        let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
+        third.contains("› 3 ") && third.contains(first)
+    });
     terminal.resize(18, 62);
     terminal.wait_screen("guidance retained while resizing", |screen| {
         let (rows, cols) = screen.size();
@@ -720,9 +785,12 @@ fn numbered_feedback_choice_sends_guidance_and_restores_original_draft() {
             .skip((rows - 5) as usize)
             .collect::<Vec<_>>()
             .join("\n");
-        editor.contains("Use option 1: inspect 世界 instead.")
-            && editor.contains("Do not create the file.")
+        editor.contains("1 Approve once") && editor.contains("2 Deny") && editor.contains(first)
     });
+    let suffix = " Keep the file.";
+    terminal.send(suffix);
+    let guidance = format!("{first}{suffix}");
+    terminal.wait_visible(&guidance);
     terminal.send("\r");
     terminal.wait_visible("Guidance acknowledged");
     terminal.wait_visible("Completed");
@@ -732,7 +800,7 @@ fn numbered_feedback_choice_sends_guidance_and_restores_original_draft() {
         item["type"] == "function_call_output"
             && item["output"]
                 .as_str()
-                .is_some_and(|text| text.contains(guidance))
+                .is_some_and(|text| text.contains(&guidance))
     }));
     assert!(!dir.path().join("created.txt").exists());
     terminal.finish();

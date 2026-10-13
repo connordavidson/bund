@@ -101,9 +101,12 @@ this shortcut without closing the interface.
 | `/exit` | Show the two-press Ctrl+C exit shortcut |
 
 Approval choices appear inside the query box: **1 Approve once**, **2 Deny**,
-and **3 Tell Bund what to do**. The last choice opens a separate guidance editor;
-Enter declines the proposed action and sends the guidance to Bund. Esc returns
-to the choices. Your original draft and cursor return after the decision or
+and **3 Tell Bund what to do**. Use Up/Down to select a choice and Enter to answer;
+1 and 2 also answer immediately. The last choice is an inline input with a gray
+placeholder: arrow down to it or press 3, then start typing. Enter declines the
+proposed action and sends the guidance to Bund. Up from the first line or Esc
+returns to the choices without losing the guidance; Down focuses it again.
+Your original draft and cursor return after the decision or
 cancellation. Ctrl+Y/Ctrl+N remain shortcuts for approve/deny from the choices.
 While an approval is pending, the mouse wheel and PageUp/PageDown scroll its
 preview in the middle of the screen; Ctrl+O still toggles activity. Exiting restores your previous terminal
