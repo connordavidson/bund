@@ -1,12 +1,12 @@
 # Architecture and extension contract
 
 Bund owns its agent loop. Vendor SDKs or other coding agents do not execute
-workspace tools on its behalf. The initial client is an inline terminal, but
+workspace tools on its behalf. The initial client is a fullscreen terminal, but
 authorization, state transitions, persistence, and provider access are reusable
 Rust library behavior.
 
 ```text
-bund-cli (inline UI / headless)
+bund-cli (fullscreen UI / headless)
           |
           v
 bund-core (Engine, SessionHandle, commands, snapshots, events)
@@ -33,6 +33,15 @@ Tokio broadcast `Lagged` is a resynchronization signal: recover using
 exclude opaque provider continuation bytes. Clients submit `answer_approval`
 or `cancel`; they never implement their own authorization decisions inside
 the execution path.
+
+`Transcript` reduces ordered events into bounded, terminal-independent runs,
+responses, and tool activity. `TranscriptLimits` controls the retained window;
+clients can replay other windows through `events_after`. Response lifecycle
+events identify conversation versus compaction calls, reconcile provisional
+text with authoritative completion, and retain visible reasoning separately
+from opaque continuation. `RunOutput` identifies the answer or explicitly
+requested local tool result; `RunFinished` supplies its completion and validation
+status. Existing saved event records remain readable.
 
 Use `Provider` for a statically linked vendor adapter, `Tool` for a local tool,
 `CommandExecutor` for another execution environment, and `SessionStore` for
@@ -92,11 +101,27 @@ stops instead of silently dropping required context.
 
 ## Terminal boundary
 
-One Crossterm event source and Ratatui inline renderer own the terminal. No
-alternate screen is entered. Complete output enters native scrollback; only
-the working region is redrawn. The composer survives streaming and approval
-requests. Model and process output is sanitized before display. Headless output
-uses the same engine without terminal initialization.
+One Crossterm event source and one fullscreen Ratatui renderer own the terminal.
+The interactive client enters the alternate screen and restores the original
+screen and terminal modes on exit. Workspace, model, status, and keyboard hints
+stay at the top; the query box stays at the bottom. Approval controls occupy a
+pinned strip, with a scrollable review preview in the middle. The composer
+survives streaming, expansion, resize, and approval requests.
+
+The conversation is retained application state, not text appended to native
+scrollback. Ordered session events reconstruct response text, tool activity,
+and provider-supplied reasoning summaries on resume. Completed responses
+reconcile streamed progress in place. Ctrl+O changes the same transcript's
+layout, revealing orange activity boxes beneath their responses; a stable
+message anchor preserves the reader's position. PageUp/PageDown stop following
+new output, and Ctrl+End resumes following. Pending approvals take priority over
+ordinary transcript scrolling.
+
+Model and process output is sanitized before display. Opaque provider
+continuation, signatures, and encrypted reasoning remain outside the visible
+transcript. Models may omit reasoning summaries; the client does not generate
+its own. Headless output uses the same engine without terminal initialization
+and retains its existing text and JSONL behavior.
 
 ## Trust and limits
 

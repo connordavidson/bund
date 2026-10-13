@@ -1,6 +1,6 @@
 # Bund
 
-A Rust coding agent with an inline terminal interface and a reusable Rust SDK.
+A Rust coding agent with a fullscreen terminal interface and a reusable Rust SDK.
 Bund reads a repository, proposes focused changes, asks before edits and host
 commands, runs configured checks, and saves sessions for later continuation.
 Use Anthropic Messages or OpenAI Responses with your own API credentials.
@@ -57,12 +57,20 @@ The current directory becomes the workspace; no launcher script is required.
 
 ## Terminal workflow
 
-The interface stays on the primary terminal screen, with a bordered composer
-at the bottom that remains visible while work runs and approvals are pending.
-Completed text remains in native scrollback after exit. Enter submits, Alt+Enter or Ctrl+J inserts a
-newline, Tab completes slash commands and `@path` references, and Up/Down recalls
-history on a single-line draft. An `@path` identifies a file for the agent to
-read; it does not silently attach file contents.
+The fullscreen interface shows workspace, model, run status, and keyboard
+controls at the top, a scrollable conversation in the middle, and a cyan
+bordered query box fixed at the bottom. The query box keeps your draft visible
+while work runs and approvals are pending. Enter submits, Alt+Enter or Ctrl+J
+inserts a newline, Tab completes slash commands and `@path` references, and
+Up/Down recalls history on a single-line draft. An `@path` identifies a file for
+the agent to read; it does not silently attach file contents.
+
+Routine activity is collapsed by default. **Ctrl+O** expands or collapses
+orange activity boxes beneath the corresponding responses, including tools
+and any reasoning summary supplied by the provider. A model may provide no
+reasoning summary. **PageUp/PageDown** scroll the conversation and pause
+following new output; **Ctrl+End** returns to the latest output. Expanding
+activity preserves your place in the conversation and your draft.
 
 Typing while a run is active preserves a draft. A busy submission keeps that
 draft; queued steering is future work. Esc/Ctrl+C cancels active work and its
@@ -82,7 +90,12 @@ draft. Ctrl+D on an empty composer or `/exit` also exits.
 | `/accept-edits on\|off` | Control direct-edit approvals for this session |
 | `/exit` | Cancel active work, restore the terminal, and exit |
 
-Long approval previews can be paged in the inline region. Project `AGENTS.md`
+Approval controls remain visible at the top. While an approval is pending,
+PageUp/PageDown scroll its preview in the middle of the screen; Ctrl+O still
+toggles activity. Exiting restores your previous terminal screen. Use
+`bund sessions` and `bund resume SESSION_ID` to revisit saved conversations.
+
+Project `AGENTS.md`
 guidance loads by directory scope; `CLAUDE.md` is the fallback at a directory
 without `AGENTS.md`. Instructions and skills never grant execution permission.
 
@@ -279,7 +292,7 @@ workflow artifacts; it does not automatically publish a GitHub release.
 
 This MVP includes one agent, both native API adapters, reviewed workspace tools,
 durable sessions, configured checks, simple skills, and the embeddable engine.
-Its inline transcript uses basic styling rather than a rich Markdown viewer.
+Its fullscreen transcript uses basic styling rather than a rich Markdown viewer.
 MCP, general hooks, sandbox backends, subagents, desktop/IDE clients, schedules,
 plugins and additional model providers are future work.
 

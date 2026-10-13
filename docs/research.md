@@ -57,7 +57,9 @@ or a promise of command-for-command compatibility.
 ## Rust terminal choice
 
 [Ratatui's inline viewport](https://docs.rs/ratatui/latest/ratatui/struct.Terminal.html#method.insert_before)
-supports permanent output above a live working region. Use one renderer and
-one Crossterm event source. Subprocesses send events rather than writing to the
-terminal. Native scrollback and actual cursor behavior require PTY tests;
-widget snapshots alone are insufficient.
+was the initial choice for permanent output above a live working region.
+The subsequent UI decision uses a fullscreen alternate screen so historical
+activity can expand in place. See the [terminal architecture](architecture.md#terminal-boundary).
+Use one renderer and one Crossterm event source; subprocesses send events rather
+than writing to the terminal. Screen restoration and actual cursor behavior
+require PTY tests; widget snapshots alone are insufficient.

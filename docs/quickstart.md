@@ -79,14 +79,21 @@ For a Rust project, start with a validation command:
 bund --check 'cargo test'
 ```
 
-Ask for a small change. Enter submits; Ctrl+J adds a newline. The bottom textbox
-keeps your draft visible during streaming and approvals. Ctrl+Y approves the
-displayed action once; Ctrl+N or Esc denies it. Ctrl+C cancels active work.
-Completed edits remain after cancellation.
+Ask for a small change. The fullscreen interface keeps workspace and status
+information at the top and a cyan query box at the bottom. Enter submits;
+Ctrl+J adds a newline. Your draft remains visible during streaming and
+approvals. Ctrl+Y approves the displayed action once; Ctrl+N or Esc denies it.
+Ctrl+C cancels active work. Completed edits remain after cancellation.
+
+Ctrl+O expands orange activity boxes beneath responses, including tools and
+provider-supplied reasoning summaries; press it again to collapse them.
+PageUp/PageDown scroll the conversation without following new output, and
+Ctrl+End returns to the latest output. During approvals, PageUp/PageDown scroll
+the review preview while the decision controls remain visible at the top.
 
 When idle, use `/diff` to review changes, `/check` to run configured checks, and
-`/exit` to leave. Checks use the same command approval flow. Completed output
-remains in terminal scrollback.
+`/exit` to leave. Checks use the same command approval flow. Exiting restores
+your previous terminal screen; reopen saved conversations with:
 
 ```sh
 bund sessions

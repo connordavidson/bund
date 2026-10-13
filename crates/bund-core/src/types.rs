@@ -223,6 +223,9 @@ pub enum ProviderEvent {
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub text: String,
+    /// Authoritative provider-visible summaries, never hidden reasoning or
+    /// opaque continuation payloads. Replaces display-only streamed fragments.
+    pub reasoning: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub continuation: Option<Continuation>,
     pub usage: Usage,
@@ -404,11 +407,43 @@ pub enum ValidationStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsePurpose {
+    Conversation,
+    Compaction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
     RunStarted {
         prompt: String,
+    },
+    ResponseStarted {
+        id: String,
+        purpose: ResponsePurpose,
+    },
+    ResponseTextDelta {
+        id: String,
+        text: String,
+    },
+    ResponseReasoningDelta {
+        id: String,
+        text: String,
+    },
+    ResponseCompleted {
+        id: String,
+        purpose: ResponsePurpose,
+        text: String,
+        reasoning: Vec<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    /// The final authoritative user-facing output. RunFinished still reports
+    /// failure if validation failed. A local operation has no response ID.
+    RunOutput {
+        response_id: Option<String>,
+        text: String,
     },
     TextDelta {
         text: String,

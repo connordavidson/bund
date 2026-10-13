@@ -406,7 +406,22 @@ impl Session {
         self.approval.lock().await.take();
         state.pending_approval = None;
         let (status, message) = match result {
-            Ok(message) => (RunStatus::Completed, message),
+            Ok((message, response_id)) => {
+                if let Err(error) = self
+                    .emit(
+                        &mut state,
+                        EventKind::RunOutput {
+                            response_id,
+                            text: message.clone(),
+                        },
+                    )
+                    .await
+                {
+                    (RunStatus::Failed, error.to_string())
+                } else {
+                    (RunStatus::Completed, message)
+                }
+            }
             Err(Error::Cancelled) => (
                 RunStatus::Cancelled,
                 "Cancelled; any completed edits remain on disk.".into(),
@@ -454,9 +469,13 @@ impl Session {
         }
     }
 
-    async fn perform(&self, operation: Operation, cancel: CancellationToken) -> Result<String> {
-        match operation {
-            Operation::Prompt => self.agent_loop(cancel).await,
+    async fn perform(
+        &self,
+        operation: Operation,
+        cancel: CancellationToken,
+    ) -> Result<(String, Option<String>)> {
+        let text = match operation {
+            Operation::Prompt => return self.agent_loop(cancel).await,
             Operation::Compact => {
                 self.compact_history(cancel, true).await?;
                 Ok("Context compacted.".into())
@@ -492,7 +511,8 @@ impl Session {
                 self.store.commit(&state, &[]).await?;
                 Ok(result)
             }
-        }
+        }?;
+        Ok((text, None))
     }
 
     async fn host_tool(
@@ -523,7 +543,7 @@ impl Session {
         Ok(output.content)
     }
 
-    async fn agent_loop(&self, cancel: CancellationToken) -> Result<String> {
+    async fn agent_loop(&self, cancel: CancellationToken) -> Result<(String, Option<String>)> {
         let max_rounds = self.state.lock().await.options.limits.max_rounds;
         let mut checks_current = false;
         let mut changed = false;
@@ -533,7 +553,9 @@ impl Session {
             }
             self.compact_history(cancel.clone(), false).await?;
             let request = self.request().await?;
-            let response = self.provider_call(request, cancel.clone()).await?;
+            let (response_id, response) = self
+                .provider_call(request, cancel.clone(), ResponsePurpose::Conversation)
+                .await?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -607,11 +629,22 @@ impl Session {
                     continue;
                 }
                 if changed && self.state.lock().await.validation == ValidationStatus::Failed {
+                    // The completed explanation is still the final answer even
+                    // though validation makes the overall run unsuccessful.
+                    let mut state = self.state.lock().await;
+                    self.emit(
+                        &mut state,
+                        EventKind::RunOutput {
+                            response_id: Some(response_id),
+                            text: response.text,
+                        },
+                    )
+                    .await?;
                     return Err(Error::Invalid(
                         "work ended with failing validation checks".into(),
                     ));
                 }
-                return Ok(response.text);
+                return Ok((response.text, Some(response_id)));
             }
             for call in calls {
                 let result = if let Some(tool) = self.tools.get(&call.name).cloned() {
@@ -705,7 +738,8 @@ impl Session {
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
-    ) -> Result<ProviderResponse> {
+        purpose: ResponsePurpose,
+    ) -> Result<(String, ProviderResponse)> {
         request
             .profile
             .validate_capabilities(!request.tools.is_empty())?;
@@ -713,6 +747,18 @@ impl Session {
             .providers
             .get(&request.profile.provider)
             .ok_or_else(|| Error::Invalid("provider not configured".into()))?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut state = self.state.lock().await;
+            self.emit(
+                &mut state,
+                EventKind::ResponseStarted {
+                    id: id.clone(),
+                    purpose,
+                },
+            )
+            .await?;
+        }
         let (tx, mut rx) = mpsc::channel(64);
         let work = provider.complete(request, tx, cancel.clone());
         tokio::pin!(work);
@@ -723,10 +769,10 @@ impl Session {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                _ = tick.tick(), if !pending_text.is_empty() => { self.flush_text(&mut pending_text).await?; }
+                _ = tick.tick(), if !pending_text.is_empty() => { self.flush_text(&mut pending_text, &id, purpose).await?; }
                 event = rx.recv(), if !rx.is_closed() || !rx.is_empty() => {
                     if let Some(event) = event {
-                        self.provider_progress(event, &mut pending_text).await?;
+                        self.provider_progress(event, &mut pending_text, &id, purpose).await?;
                     }
                 }
                 result = &mut work => {
@@ -734,10 +780,16 @@ impl Session {
                     // complete in the same turn, after recv() was polled empty.
                     // Drain those before publishing the completed response.
                     while let Ok(event) = rx.try_recv() {
-                        self.provider_progress(event, &mut pending_text).await?;
+                        self.provider_progress(event, &mut pending_text, &id, purpose).await?;
                     }
-                    self.flush_text(&mut pending_text).await?;
-                    return result;
+                    self.flush_text(&mut pending_text, &id, purpose).await?;
+                    let response = result?;
+                    let mut state = self.state.lock().await;
+                    self.emit(&mut state, EventKind::ResponseCompleted {
+                        id: id.clone(), purpose, text: response.text.clone(),
+                        reasoning: response.reasoning.clone(), tool_calls: response.tool_calls.clone(),
+                    }).await?;
+                    return Ok((id, response));
                 }
             }
         }
@@ -747,30 +799,57 @@ impl Session {
         &self,
         event: ProviderEvent,
         pending_text: &mut String,
+        id: &str,
+        purpose: ResponsePurpose,
     ) -> Result<()> {
         match event {
             ProviderEvent::TextDelta(text) => {
                 pending_text.push_str(&text);
                 if pending_text.len() >= 4096 {
-                    self.flush_text(pending_text).await?;
+                    self.flush_text(pending_text, id, purpose).await?;
                 }
             }
             ProviderEvent::ReasoningSummary(text) => {
-                self.flush_text(pending_text).await?;
+                self.flush_text(pending_text, id, purpose).await?;
                 let mut state = self.state.lock().await;
-                self.emit(&mut state, EventKind::ReasoningSummary { text })
-                    .await?;
+                self.emit(
+                    &mut state,
+                    EventKind::ResponseReasoningDelta {
+                        id: id.into(),
+                        text: text.clone(),
+                    },
+                )
+                .await?;
+                if purpose == ResponsePurpose::Conversation {
+                    self.emit(&mut state, EventKind::ReasoningSummary { text })
+                        .await?;
+                }
             }
             ProviderEvent::Retrying { .. } => {}
         }
         Ok(())
     }
 
-    async fn flush_text(&self, buffer: &mut String) -> Result<()> {
+    async fn flush_text(
+        &self,
+        buffer: &mut String,
+        id: &str,
+        purpose: ResponsePurpose,
+    ) -> Result<()> {
         if !buffer.is_empty() {
             let text = std::mem::take(buffer);
             let mut state = self.state.lock().await;
-            self.emit(&mut state, EventKind::TextDelta { text }).await?;
+            self.emit(
+                &mut state,
+                EventKind::ResponseTextDelta {
+                    id: id.into(),
+                    text: text.clone(),
+                },
+            )
+            .await?;
+            if purpose == ResponsePurpose::Conversation {
+                self.emit(&mut state, EventKind::TextDelta { text }).await?;
+            }
         }
         Ok(())
     }
@@ -1077,7 +1156,9 @@ impl Session {
         if estimate_context(&summarize.instructions, &summarize.messages, &[])? >= available {
             return Err(Error::ContextLimit("history is too large to summarize with this profile; use a larger context window or a fresh session".into()));
         }
-        let response = self.provider_call(summarize, cancel).await?;
+        let (_, response) = self
+            .provider_call(summarize, cancel, ResponsePurpose::Compaction)
+            .await?;
         if !response.tool_calls.is_empty() || response.text.trim().is_empty() {
             return Err(Error::ContextLimit(
                 "provider failed to produce a usable summary; history retained".into(),

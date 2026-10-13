@@ -51,6 +51,7 @@ impl Provider for FakeProvider {
 }
 fn response(calls: Vec<ToolCall>) -> ProviderResponse {
     ProviderResponse {
+        reasoning: vec![],
         text: if calls.is_empty() {
             "Finished".into()
         } else {
@@ -394,7 +395,29 @@ async fn compaction_retains_actual_requests_and_scoped_guidance() {
     }
     let events = session.attach().await.unwrap().events;
     session.compact().await.unwrap();
-    assert_eq!(finish(&session, events, true).await.0, RunStatus::Completed);
+    let (status, compact_events) = finish(&session, events, true).await;
+    assert_eq!(status, RunStatus::Completed);
+    assert!(compact_events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::ResponseStarted {
+            purpose: ResponsePurpose::Compaction,
+            ..
+        }
+    )));
+    assert!(compact_events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::ResponseCompleted {
+            purpose: ResponsePurpose::Compaction,
+            ..
+        }
+    )));
+    assert!(!compact_events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::TextDelta { .. }
+            | EventKind::ReasoningSummary { .. }
+            | EventKind::AssistantMessage { .. }
+    )));
+    assert!(compact_events.iter().any(|event| matches!(&event.kind, EventKind::RunOutput { response_id: None, text } if text == "Context compacted.")));
     let events = session.attach().await.unwrap().events;
     session.submit("Continue".into()).await.unwrap();
     assert_eq!(finish(&session, events, true).await.0, RunStatus::Completed);
@@ -538,7 +561,9 @@ async fn inspection_does_not_run_configured_mutating_checks() {
 async fn final_queued_stream_delta_is_persisted_before_completed_message() {
     let repo = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    let provider = Arc::new(FakeProvider::new(vec![response(vec![])]));
+    let mut answer = response(vec![]);
+    answer.reasoning = vec!["Authoritative visible summary".into()];
+    let provider = Arc::new(FakeProvider::new(vec![answer]));
     let session = engine(Arc::new(SqliteStore::open(data.path()).unwrap()), provider)
         .create_session(SessionOptions::new(
             repo.path().into(),
@@ -563,5 +588,106 @@ async fn final_queued_stream_delta_is_persisted_before_completed_message() {
             )
             .unwrap();
         assert!(delta < message);
+        let (response_id, completed) = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ResponseCompleted {
+                    id,
+                    purpose: ResponsePurpose::Conversation,
+                    text,
+                    reasoning,
+                    tool_calls,
+                } => {
+                    assert_eq!(text, "Finished");
+                    assert_eq!(reasoning, &["Authoritative visible summary"]);
+                    assert!(tool_calls.is_empty());
+                    Some((id, event.sequence))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(&event.kind, EventKind::ResponseStarted { id, purpose: ResponsePurpose::Conversation } if id == response_id) && event.sequence < completed));
+        assert!(events.iter().any(|event| matches!(&event.kind, EventKind::RunOutput { response_id: Some(id), text } if id == response_id && text == "Finished") && event.sequence > completed));
+        let mut transcript = Transcript::default();
+        for event in &events {
+            transcript.apply(event);
+        }
+        let run = transcript.runs().back().unwrap();
+        assert_eq!(run.responses.len(), 1);
+        assert!(run.responses[0].is_final);
+        assert_eq!(
+            run.responses[0].reasoning,
+            ["Authoritative visible summary"]
+        );
     }
+}
+
+#[tokio::test]
+async fn explicit_local_tool_has_authoritative_output_without_model_response() {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("file"), "local output").unwrap();
+    let session = engine(
+        Arc::new(SqliteStore::open(data.path()).unwrap()),
+        Arc::new(FakeProvider::new(vec![])),
+    )
+    .create_session(SessionOptions::new(
+        repo.path().into(),
+        ModelProfile::new("fake", "fixture"),
+    ))
+    .await
+    .unwrap();
+    let events = session.attach().await.unwrap().events;
+    session
+        .run_tool("read_file", json!({"path":"file"}))
+        .await
+        .unwrap();
+    let (status, events) = finish(&session, events, true).await;
+    assert_eq!(status, RunStatus::Completed);
+    assert!(events.iter().any(|event| matches!(&event.kind, EventKind::RunOutput { response_id: None, text } if text.contains("local output"))));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ResponseStarted { .. })));
+}
+
+#[tokio::test]
+async fn failing_validation_retains_the_final_authoritative_explanation() {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut explanation = response(vec![]);
+    explanation.text = "The edit is present, but validation failed.".into();
+    let provider = Arc::new(FakeProvider::new(vec![
+        response(vec![call(
+            "edit",
+            "apply_patch",
+            json!({"path":"file","content":"new"}),
+        )]),
+        response(vec![]),
+        explanation,
+    ]));
+    let mut options = SessionOptions::new(repo.path().into(), ModelProfile::new("fake", "fixture"));
+    options.checks = vec!["false".into()];
+    let session = engine(Arc::new(SqliteStore::open(data.path()).unwrap()), provider)
+        .create_session(options)
+        .await
+        .unwrap();
+    let events = session.attach().await.unwrap().events;
+    session
+        .submit("Make the edit and validate".into())
+        .await
+        .unwrap();
+    let (status, events) = finish(&session, events, true).await;
+    assert_eq!(status, RunStatus::Failed);
+    let mut transcript = Transcript::default();
+    for event in &events {
+        transcript.apply(event);
+    }
+    let run = transcript.runs().back().unwrap();
+    assert_eq!(
+        run.output.as_deref(),
+        Some("The edit is present, but validation failed.")
+    );
+    assert!(run.responses.last().unwrap().is_final);
+    assert_eq!(run.validation, ValidationStatus::Failed);
+    assert!(run.error.as_deref().unwrap().contains("failing validation"));
 }

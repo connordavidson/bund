@@ -1,7 +1,7 @@
 # Implementation plan and release gates
 
 Accepted baseline: October 13, 2026. Build from `master`; preserve the earlier
-deterministic-capability branches. Target macOS/Linux, native Rust, inline
+deterministic-capability branches. Target macOS/Linux, native Rust, fullscreen
 terminal interaction, approved host commands, Anthropic/OpenAI, and an SDK for
 a future Rust desktop client.
 
@@ -13,8 +13,8 @@ a future Rust desktop client.
    durable sessions, cancellation, workspace locks and coding tools.
 3. Implement native Responses and Messages adapters with streaming fixtures,
    errors, usage, bounded retries, continuation and context handling.
-4. Add inline composition, session management, approval/diff controls,
-   simple manually invoked skills and configured checks.
+4. Add fullscreen composition, expandable activity, session management,
+   approval/diff controls, simple manually invoked skills and configured checks.
 5. Harden with process/PTY/recovery tests, independent SDK use, installation
    documentation and packaged binaries. Live evaluations are opt-in.
 
@@ -29,7 +29,8 @@ a future Rust desktop client.
 - Compaction preserves user constraints and complete tool-result sequences.
 - Large output and slow subscribers remain bounded and resynchronizable.
 - Terminal draft, paste, Unicode, resize, interrupt and cleanup behavior pass
-  PTY tests; native scrollback remains available after exit.
+  PTY tests; exit restores the original terminal screen, and sessions retain
+  conversation history for resume.
 - An independent Rust example drives the engine without the CLI.
 - Formatting, linting and tests pass on macOS/Linux.
 

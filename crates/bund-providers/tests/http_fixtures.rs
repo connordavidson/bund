@@ -108,9 +108,22 @@ fn event(value: Value) -> String {
 }
 
 fn openai(turn: usize, calls: &[(&str, Value)], text: &str) -> String {
+    openai_with_reasoning(turn, calls, text, &[])
+}
+
+fn openai_with_reasoning(
+    turn: usize,
+    calls: &[(&str, Value)],
+    text: &str,
+    summaries: &[&str],
+) -> String {
     let id = format!("resp_{turn}");
+    let summary: Vec<_> = summaries
+        .iter()
+        .map(|text| json!({"type":"summary_text", "text":text}))
+        .collect();
     let mut items = vec![
-        json!({"type":"reasoning","id":format!("rs_{turn}"),"summary":[],"encrypted_content":format!("opaque_{turn}")}),
+        json!({"type":"reasoning","id":format!("rs_{turn}"),"summary":summary,"encrypted_content":format!("opaque_{turn}")}),
     ];
     if !text.is_empty() {
         items.push(json!({"type":"message","id":format!("msg_{turn}"),"role":"assistant","status":"completed", "content":[{"type":"output_text","text":text,"annotations":[]}]}));
@@ -131,6 +144,11 @@ fn openai(turn: usize, calls: &[(&str, Value)], text: &str) -> String {
         ));
         if item["type"] == "message" {
             stream.push_str(&event(json!({"type":"response.output_text.delta","output_index":index,"item_id":item["id"],"delta":text})));
+        }
+        if item["type"] == "reasoning" {
+            for (summary_index, summary) in summaries.iter().enumerate() {
+                stream.push_str(&event(json!({"type":"response.reasoning_summary_text.delta", "output_index":index, "item_id":item["id"], "summary_index":summary_index, "delta":summary})));
+            }
         }
         if item["type"] == "function_call" {
             for part in item["arguments"].as_str().unwrap().as_bytes().chunks(3) {
@@ -526,4 +544,189 @@ async fn cancellation_before_request_spends_nothing() {
         .complete(request("openai", "http://127.0.0.1:1/v1"), events, token)
         .await;
     assert!(matches!(result, Err(Error::Cancelled)));
+}
+
+#[tokio::test]
+async fn terminal_reasoning_repairs_dropped_progress_without_exposing_opaque_state() {
+    for (provider, stream, expected) in [
+        (
+            Arc::new(OpenAiProvider::new("fixture-key".into())) as Arc<dyn Provider>,
+            openai_with_reasoning(
+                0,
+                &[],
+                "Final answer.",
+                &["First résumé.", "", "Second summary."],
+            ),
+            vec!["First résumé.", "Second summary."],
+        ),
+        (
+            Arc::new(AnthropicProvider::new("fixture-key".into())) as Arc<dyn Provider>,
+            anthropic(0, &[], "Final answer."),
+            vec!["A brief summary."],
+        ),
+    ] {
+        let (endpoint, _requests, task) = server(vec![Reply::sse(stream)]).await;
+        let (events, mut receiver) = mpsc::channel(1);
+        events
+            .send(ProviderEvent::TextDelta("queue occupied".into()))
+            .await
+            .unwrap();
+        let response = provider
+            .complete(
+                request(provider.id(), &endpoint),
+                events,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.reasoning, expected);
+        assert_eq!(response.text, "Final answer.");
+        assert!(
+            matches!(receiver.recv().await, Some(ProviderEvent::TextDelta(text)) if text == "queue occupied")
+        );
+        assert!(
+            receiver.recv().await.is_none(),
+            "all progress was deliberately dropped"
+        );
+        let visible = format!("{}{:?}", response.text, response.reasoning);
+        assert!(!visible.contains("opaque_") && !visible.contains("signed_"));
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn anthropic_collects_initial_thinking_and_skips_empty_and_redacted_blocks() {
+    let blocks = [
+        json!({"type":"thinking", "thinking":"Initial summary.", "signature":"secret-signature"}),
+        json!({"type":"redacted_thinking", "data":"secret-redacted-data"}),
+        json!({"type":"thinking", "thinking":"", "signature":"another-secret-signature"}),
+        json!({"type":"text", "text":"Answer."}),
+    ];
+    let mut stream = event(
+        json!({"type":"message_start","message":{"id":"m", "role":"assistant", "content":[], "usage":{"input_tokens":1,"output_tokens":1}}}),
+    );
+    for (index, block) in blocks.iter().enumerate() {
+        stream.push_str(&event(
+            json!({"type":"content_block_start", "index":index, "content_block":block}),
+        ));
+        stream.push_str(&event(json!({"type":"content_block_stop", "index":index})));
+    }
+    stream.push_str(&event(json!({"type":"message_delta", "delta":{"stop_reason":"end_turn"}, "usage":{"output_tokens":10}})));
+    stream.push_str(&event(json!({"type":"message_stop"})));
+    let (endpoint, _requests, task) = server(vec![Reply::sse(stream)]).await;
+    let response = complete(
+        &AnthropicProvider::new("fixture-key".into()),
+        request("anthropic", &endpoint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.reasoning, ["Initial summary."]);
+    assert_eq!(response.text, "Answer.");
+    let native: Value = serde_json::from_slice(&response.continuation.unwrap().payload).unwrap();
+    assert_eq!(native[0]["signature"], "secret-signature");
+    assert_eq!(native[1]["data"], "secret-redacted-data");
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn optional_summary_rejection_retries_once_preserving_the_entire_remaining_request() {
+    for (provider, rejection, stream, parent, field, option) in [
+        (
+            Arc::new(OpenAiProvider::new("fixture-key".into())) as Arc<dyn Provider>,
+            json!({"error":{"param":"reasoning.summary", "code":"unsupported_value", "message":"Unsupported value: auto is not supported with this model"}}),
+            openai(0, &[], "Answer."),
+            "reasoning",
+            "summary",
+            "auto",
+        ),
+        (
+            Arc::new(AnthropicProvider::new("fixture-key".into())) as Arc<dyn Provider>,
+            json!({"error":{"type":"invalid_request_error", "message":"thinking.display: Extra inputs are not permitted"}}),
+            anthropic(0, &[], "Answer."),
+            "thinking",
+            "display",
+            "summarized",
+        ),
+    ] {
+        let (endpoint, mut requests, task) =
+            server(vec![Reply::error(400, "", rejection), Reply::sse(stream)]).await;
+        let mut req = request(provider.id(), &endpoint);
+        req.profile.model = if provider.id() == "openai" {
+            "gpt-5-nano"
+        } else {
+            "claude-sonnet-4-6"
+        }
+        .into();
+        req.profile.reasoning = Some(
+            if provider.id() == "openai" {
+                "minimal"
+            } else {
+                "low"
+            }
+            .into(),
+        );
+        assert_eq!(
+            complete(provider.as_ref(), req).await.unwrap().text,
+            "Answer."
+        );
+        let mut first = requests.recv().await.unwrap();
+        let second = requests.recv().await.unwrap();
+        assert_eq!(first[parent][field], option);
+        first[parent].as_object_mut().unwrap().remove(field);
+        assert_eq!(
+            first, second,
+            "only the optional display/summary field may change"
+        );
+        task.await.unwrap();
+        assert!(requests.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn unsupported_effort_and_repeated_summary_rejection_do_not_trigger_extra_calls() {
+    for (error, expected_calls) in [
+        (
+            json!({"error":{"param":"reasoning.effort", "code":"unsupported_value", "message":"minimal is not supported"}}),
+            1,
+        ),
+        (
+            json!({"error":{"param":"reasoning.summary", "code":"unsupported_parameter", "message":"summary is not supported"}}),
+            2,
+        ),
+        (
+            json!({"error":{"type":"authentication_error", "param":"reasoning.summary", "message":"unsupported"}}),
+            1,
+        ),
+    ] {
+        let replies = (0..expected_calls)
+            .map(|_| Reply::error(400, "", error.clone()))
+            .collect();
+        let (endpoint, mut requests, task) = server(replies).await;
+        let mut req = request("openai", &endpoint);
+        req.profile.reasoning = Some("minimal".into());
+        assert!(complete(&OpenAiProvider::new("fixture-key".into()), req)
+            .await
+            .is_err());
+        task.await.unwrap();
+        let mut received = 0;
+        while requests.recv().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(received, expected_calls);
+    }
+}
+
+#[tokio::test]
+async fn in_stream_summary_rejection_never_restarts_the_request() {
+    let mut stream = event(json!({"type":"response.created", "response":{"id":"r"}}));
+    stream.push_str(&event(json!({"type":"error", "error":{"param":"reasoning.summary", "code":"unsupported_parameter", "message":"summary is not supported"}})));
+    let (endpoint, mut requests, task) = server(vec![Reply::sse(stream)]).await;
+    let mut req = request("openai", &endpoint);
+    req.profile.reasoning = Some("minimal".into());
+    assert!(complete(&OpenAiProvider::new("fixture-key".into()), req)
+        .await
+        .is_err());
+    requests.recv().await.unwrap();
+    task.await.unwrap();
+    assert!(requests.recv().await.is_none());
 }

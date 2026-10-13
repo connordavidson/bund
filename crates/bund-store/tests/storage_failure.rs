@@ -92,6 +92,7 @@ impl Provider for TwoCalls {
     ) -> Result<ProviderResponse> {
         self.0.provider_calls.fetch_add(1, Ordering::SeqCst);
         Ok(ProviderResponse {
+            reasoning: vec![],
             text: "Run the two proposed actions.".into(),
             tool_calls: vec![
                 ToolCall {

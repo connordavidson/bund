@@ -100,6 +100,7 @@ impl Provider for ExampleProvider {
         };
         let _ = events.send(ProviderEvent::TextDelta(text.into())).await;
         Ok(ProviderResponse {
+            reasoning: vec![],
             text: text.into(),
             tool_calls,
             continuation: None,

@@ -335,6 +335,7 @@ mod tests {
                 .unwrap();
             Ok(ProviderResponse {
                 text: "fixture".into(),
+                reasoning: Vec::new(),
                 tool_calls: Vec::new(),
                 continuation: None,
                 usage: Usage {
