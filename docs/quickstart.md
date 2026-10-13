@@ -82,15 +82,23 @@ bund --check 'cargo test'
 Ask for a small change. The fullscreen interface keeps workspace and status
 information at the top and a cyan query box at the bottom. Enter submits;
 Ctrl+J adds a newline. Your draft remains visible during streaming. Approval
-choices appear inside the query box: **1 Approve once**, **2 Deny**, and
-**3 Tell Bund what to do**. Use Up/Down and Enter, or press a choice's number.
+choices appear inside the query box: **1 Approve once**, **2 Approve for this
+session**, and **3 Tell Bund what to do differently**. Use Up/Down and Enter,
+or press a choice's number.
 The last choice is a gray placeholder you can type into as soon as you arrow
-down to it or press 3. Enter declines the proposed action and sends your guidance
-to Bund. Up from its first line or Esc returns to the choices without losing
-what you typed. Your original draft is preserved and returns after the decision or
-cancellation.
+down to it or press 3. Enter in the input declines the proposed action and sends
+your guidance to Bund. Up from its first line or Esc returns to the choices
+without losing what you typed. Your original
+draft is preserved and returns after the decision or cancellation.
+Ctrl+N or Esc from the choices denies without feedback.
 The first Ctrl+C cancels active work and keeps your draft. Completed edits
 remain after cancellation.
+
+**Approve for this session** allows later workspace edits when approving an
+edit, or repeats of that exact command in that same working directory when
+approving a command. Other commands and directories still require approval.
+The grant stays with this saved session ID, including after resume; it does not
+apply to new sessions. Plan mode still blocks edits and shell commands.
 
 Blue dots mark your queries and gray dots mark Bund's responses. A blank line
 separates them, and continuation lines align with the message text.

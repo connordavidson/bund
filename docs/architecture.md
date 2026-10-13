@@ -62,6 +62,13 @@ Approvals bind to normalized operations and observed preconditions. All writes
 and commands are checked again at dispatch, including calls invented by a model
 that were not advertised in Plan mode.
 
+Approving for the session persists a scoped grant in that session's policy.
+Workspace edits enable `accept_edits`; command grants bind the exact command
+string and normalized working directory. The engine validates the pending operation
+again before recording a grant and dispatching it. Resume restores those grants
+only for the same session ID; a new session receives its own policy. These
+grants do not bypass Plan mode or change user configuration.
+
 SQLite uses WAL and full synchronous commits. Snapshot changes and ordered
 events commit together before publication; a started event commits before any
 side effect. Cross-process workspace locks are independent of the chosen state
@@ -106,14 +113,17 @@ The interactive client enters the alternate screen, captures mouse input for
 its own history navigation, and restores the original screen, mouse handling,
 and terminal modes on exit. Workspace, model, status, and keyboard hints
 stay at the top; the query box stays at the bottom. During approval, numbered
-choices replace the composer contents: 1 approves once, 2 denies, and the last
-option is an inline field with a gray Tell Bund what to do placeholder. Up/Down
-selects choices; moving down to the field immediately accepts typing. Its editor
-is separate from the original draft, cursor, and selection. Enter confirms a
-selected action or sends guidance as a denied tool result for the next model
-request. Up from the field's first line or Esc returns to the choices while
-retaining guidance. A scrollable
-review preview remains between the header and query box. The composer survives
+choices replace the composer contents: 1 approves once, 2 approves for this
+session, and 3 is an inline field with a gray Tell Bund what to do differently
+placeholder. Both the pending and ordinary composer have five rows at normal
+terminal sizes. Up/Down selects choices; moving down to the field
+immediately accepts typing. Its editor is separate from the original draft,
+cursor, and selection. Enter confirms a selected action; choosing 3 focuses
+the final field, and Enter there sends
+guidance as a denied tool result for the next model request. Up from the field's
+first line or Esc returns to the session-approval choice while
+retaining guidance. Ctrl+N or Esc from the choices still denies without feedback.
+A scrollable review preview remains between the header and query box. The composer survives
 streaming, expansion, resize, and approval requests. Interactive exit
 requires two consecutive Ctrl+C presses within 1.5 seconds. The first cancels
 active work while retaining the draft; other input or expiry resets the

@@ -257,6 +257,33 @@ impl SessionHandle {
         Ok(())
     }
     pub async fn answer_approval(&self, id: &str, decision: ApprovalDecision) -> Result<()> {
+        if decision == ApprovalDecision::ApproveSession {
+            let state = self.inner.state.lock().await;
+            let request = state
+                .pending_approval
+                .as_ref()
+                .filter(|request| request.id == id)
+                .ok_or_else(|| Error::Invalid("approval is stale or unknown".into()))?;
+            let definition = self
+                .inner
+                .tools
+                .get(&request.tool_call.name)
+                .map(|tool| tool.definition());
+            let supported = match (&request.session_scope, definition) {
+                (Some(SessionApprovalScope::WorkspaceEdits), Some(definition)) => {
+                    definition.effect == Effect::Write
+                }
+                (Some(SessionApprovalScope::Command { .. }), Some(definition)) => {
+                    request.tool_call.name == "run_command" && definition.effect == Effect::Execute
+                }
+                _ => false,
+            };
+            if state.options.policy.mode == Mode::Plan || !supported {
+                return Err(Error::Invalid(
+                    "this action does not support approval for the session".into(),
+                ));
+            }
+        }
         if let ApprovalDecision::DenyWithFeedback { feedback } = &decision {
             if feedback.trim().is_empty() {
                 return Err(Error::Invalid("approval feedback must not be blank".into()));
@@ -901,6 +928,7 @@ impl Session {
             ));
         }
         let prepared = tool.prepare(&context, call.arguments.clone()).await?;
+        let session_scope = session_approval_scope(&call, definition.effect, &prepared);
         {
             let mut state = self.state.lock().await;
             self.emit(
@@ -914,31 +942,30 @@ impl Session {
         }
         let allowed = definition.effect == Effect::Read
             || (definition.effect == Effect::Write && policy.accept_edits)
-            || (call.name == "run_command"
-                && definition.effect == Effect::Execute
-                && prepared
-                    .arguments
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|cwd| cwd == "." || cwd.is_empty())
-                && prepared
-                    .arguments
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|command| {
-                        policy
-                            .allowed_commands
-                            .iter()
-                            .any(|allowed| allowed == command)
-                    }));
+            || matches!(&session_scope, Some(SessionApprovalScope::Command { command, cwd })
+                if (cwd == "." && policy.allowed_commands.contains(command))
+                    || policy.session_commands.iter().any(|grant| &grant.command == command && &grant.cwd == cwd));
+        let mut session_grant = None;
         if !allowed {
+            let preview = match &session_scope {
+                Some(SessionApprovalScope::WorkspaceEdits) => format!(
+                    "Approve for this session: allow workspace edits in this saved session. Shell commands still require their own approval.\n\n{}",
+                    prepared.preview
+                ),
+                Some(SessionApprovalScope::Command { command, cwd }) => format!(
+                    "Approve for this session: allow only this exact command in this directory, in this saved session.\nDirectory: {cwd}\nCommand: {command}\n\n{}",
+                    prepared.preview
+                ),
+                None => prepared.preview.clone(),
+            };
             let request = ApprovalRequest {
                 id: Uuid::new_v4().to_string(),
                 run_id,
                 tool_call: call.clone(),
-                preview: prepared.preview.clone(),
+                preview,
                 fingerprint: prepared.fingerprint.clone(),
                 workspace: context.workspace.clone(),
+                session_scope,
             };
             let (sender, receiver) = oneshot::channel();
             *self.approval.lock().await = Some((request.id.clone(), sender));
@@ -965,6 +992,11 @@ impl Session {
             }
             match decision {
                 ApprovalDecision::ApproveOnce => {}
+                ApprovalDecision::ApproveSession => {
+                    session_grant = Some(request.session_scope.ok_or_else(|| {
+                        Error::Invalid("this action does not support session approval".into())
+                    })?);
+                }
                 ApprovalDecision::Deny => {
                     return Err(Error::Denied(format!("user denied {}", call.name)));
                 }
@@ -984,6 +1016,32 @@ impl Session {
             return Err(Error::Denied(
                 "action changed since approval; request a new action".into(),
             ));
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(scope) = session_grant {
+            let mut state = self.state.lock().await;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let previous_policy = state.options.policy.clone();
+            match scope {
+                SessionApprovalScope::WorkspaceEdits => state.options.policy.accept_edits = true,
+                SessionApprovalScope::Command { command, cwd } => {
+                    let grant = CommandGrant { command, cwd };
+                    if !state.options.policy.session_commands.contains(&grant) {
+                        state.options.policy.session_commands.push(grant);
+                    }
+                }
+            }
+            if let Err(error) = self.emit(&mut state, EventKind::SettingsChanged).await {
+                state.options.policy = previous_policy;
+                return Err(error);
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         {
             let mut state = self.state.lock().await;
@@ -1205,6 +1263,25 @@ impl Session {
         self.emit(&mut state, EventKind::ContextCompacted { summary })
             .await
     }
+}
+
+fn session_approval_scope(
+    call: &ToolCall,
+    effect: Effect,
+    prepared: &PreparedTool,
+) -> Option<SessionApprovalScope> {
+    if effect == Effect::Write {
+        return Some(SessionApprovalScope::WorkspaceEdits);
+    }
+    if call.name != "run_command" || effect != Effect::Execute {
+        return None;
+    }
+    let command = prepared.arguments.get("command")?.as_str()?.to_owned();
+    let cwd = prepared.arguments.get("cwd")?.as_str()?;
+    Some(SessionApprovalScope::Command {
+        command,
+        cwd: if cwd.is_empty() { "." } else { cwd }.into(),
+    })
 }
 
 fn result_message(result: ToolResult) -> Message {

@@ -29,6 +29,7 @@ const LATEST: &str = "NEW_OUTPUT_WHILE_BROWSING";
 const ORANGE: vt100::Color = vt100::Color::Rgb(255, 184, 108);
 const EXIT_CONFIRMATION: &str = "Press Ctrl+C again to exit";
 const EXIT_HELP: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
+const GUIDANCE_PLACEHOLDER: &str = "Tell Bund what to do differently";
 const HOSTILE: [&str; 3] = [
     "harmless \u{1b}[",
     "999;999Hvisible-safe\u{1b}]52;c;INERT_CLIPBOARD_MARKER",
@@ -441,9 +442,10 @@ impl Pty {
             let screen = self.screen.screen();
             let (rows, cols) = screen.size();
             let contents = screen.contents();
-            // The five-row query box touches the terminal bottom in fullscreen
-            // mode. Assert emulator cells, including color, rather than bytes.
-            let top = rows - 5;
+            // Drafts and the three approval choices share a five-row box at the
+            // bottom. Assert emulator cells rather than bytes.
+            let height = 5;
+            let top = rows - height;
             let bottom = rows - 1;
             let bordered = screen.cell(top, 0).unwrap().contents() == "╭"
                 && screen.cell(bottom, 0).unwrap().contents() == "╰"
@@ -452,7 +454,7 @@ impl Pty {
             let editor = screen
                 .rows(0, cols)
                 .skip(top as usize)
-                .take(5)
+                .take(height as usize)
                 .collect::<Vec<_>>()
                 .join("\n");
             let draft_visible =
@@ -460,8 +462,10 @@ impl Pty {
             let approval_visible = !approval
                 || (editor.contains("Approval: apply_patch")
                     && editor.contains("1 Approve once")
-                    && editor.contains("2 Deny")
-                    && editor.contains("3 Tell Bund what to do")
+                    && editor.contains("2 Approve for this session")
+                    && editor.contains("3 Tell Bund what to do differently")
+                    && !editor.contains("Deny")
+                    && !editor.contains("4 Tell")
                     && editor.contains("draft saved"));
             if screen.alternate_screen()
                 && bordered
@@ -665,6 +669,65 @@ fn first_interrupt_cancels_pending_approval_without_closing_or_losing_draft() {
 }
 
 #[test]
+fn session_approval_choice_allows_later_edits_without_another_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("session-approval-message", "Preparing two edits\n");
+        let calls = ["first.txt", "second.txt"].map(|path| {
+            json!({"type":"function_call","id":path,"call_id":path,
+                "name":"apply_patch","arguments":json!({"path":path,"content":format!("created {path}")}).to_string(),
+                "status":"completed"})
+        });
+        let response = start("session-approval-response", &item)
+            + &delta("Preparing two edits\n")
+            + &finish(
+                "session-approval-response",
+                &[item, calls[0].clone(), calls[1].clone()],
+            );
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+        drop(socket);
+        let (mut socket, request) = accept_request(&listener);
+        let results = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .count();
+        assert_eq!(
+            results, 2,
+            "both requested edits must complete after one session grant"
+        );
+        let item = message("session-approval-answer", "Both edits completed\n");
+        let response = start("session-approval-result", &item)
+            + &delta("Both edits completed\n")
+            + &finish("session-approval-result", &[item]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("create two files\r");
+    terminal.wait_composer(None, true);
+    terminal.send("2"); // Approve the edit and subsequent workspace edits for this session.
+    terminal.wait_visible("Both edits completed");
+    terminal.wait_visible("Completed");
+    terminal.wait_composer(None, false);
+    for path in ["first.txt", "second.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(path)).unwrap(),
+            format!("created {path}")
+        );
+    }
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
 fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft() {
     let dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -711,22 +774,22 @@ fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft()
         .unwrap()
         .contains("› 1 Approve once"));
     let third = screen.rows(0, cols).nth((rows - 2) as usize).unwrap();
-    let placeholder = third.find("Tell Bund what to do").unwrap();
+    let placeholder = third.find(GUIDANCE_PLACEHOLDER).unwrap();
     let column = unicode_width::UnicodeWidthStr::width(&third[..placeholder]) as u16;
     assert_eq!(
         screen.cell(rows - 2, column).unwrap().fgcolor(),
         vt100::Color::Idx(8)
     );
     terminal.send("\x1b[B");
-    terminal.wait_screen("Deny selected with Down", |screen| {
+    terminal.wait_screen("session approval selected with Down", |screen| {
         let (rows, cols) = screen.size();
         screen
             .rows(0, cols)
             .nth((rows - 3) as usize)
             .unwrap()
-            .contains("› 2 Deny")
+            .contains("› 2 Approve for this session")
     });
-    terminal.send("\x1b[B"); // The next Down moves directly into the inline field.
+    terminal.send("\x1b[B");
     terminal.wait_screen("last approval option focused", |screen| {
         let (rows, cols) = screen.size();
         screen
@@ -745,20 +808,23 @@ fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft()
             .take(3)
             .collect::<Vec<_>>();
         choices[0].contains("1 Approve once")
-            && choices[1].contains("2 Deny")
+            && choices[1].contains("2 Approve for this session")
             && choices[2].contains(first)
-            && !choices[2].contains("Tell Bund what to do")
+            && !choices[2].contains(GUIDANCE_PLACEHOLDER)
     });
-    terminal.send("\x1b[A"); // Up from the first guidance line selects Deny.
-    terminal.wait_screen("guidance retained while navigating to Deny", |screen| {
-        let (rows, cols) = screen.size();
-        let choices = screen
-            .rows(0, cols)
-            .skip((rows - 3) as usize)
-            .take(2)
-            .collect::<Vec<_>>();
-        choices[0].contains("› 2 Deny") && choices[1].contains(first)
-    });
+    terminal.send("\x1b[A"); // Up from the first guidance line returns to session approval.
+    terminal.wait_screen(
+        "guidance retained while navigating to session approval",
+        |screen| {
+            let (rows, cols) = screen.size();
+            let choices = screen
+                .rows(0, cols)
+                .skip((rows - 3) as usize)
+                .take(2)
+                .collect::<Vec<_>>();
+            choices[0].contains("› 2 Approve for this session") && choices[1].contains(first)
+        },
+    );
     terminal.send("\x1b[B");
     terminal.wait_screen("guidance refocused after Down", |screen| {
         let (rows, cols) = screen.size();
@@ -785,7 +851,9 @@ fn arrow_selected_inline_feedback_retains_guidance_and_restores_original_draft()
             .skip((rows - 5) as usize)
             .collect::<Vec<_>>()
             .join("\n");
-        editor.contains("1 Approve once") && editor.contains("2 Deny") && editor.contains(first)
+        editor.contains("1 Approve once")
+            && editor.contains("2 Approve for this session")
+            && editor.contains(first)
     });
     let suffix = " Keep the file.";
     terminal.send(suffix);
@@ -966,7 +1034,7 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     terminal.wait_composer(Some(DRAFT), true);
     terminal.resize(30, 100);
     terminal.wait_composer(Some(DRAFT), true);
-    terminal.send("2"); // The numbered choice denies and restores the composer.
+    terminal.send("\x0e"); // Ctrl+N denies without feedback and restores the composer.
     terminal.wait_visible("Denial acknowledged");
     terminal.wait_visible("Completed");
     let followup = fixture.requests.recv_timeout(WAIT).unwrap();

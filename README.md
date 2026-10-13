@@ -39,7 +39,7 @@ bund --provider anthropic --model YOUR_MODEL_ID --workspace /path/to/repository
 Ask for a small change, such as “Find the date parser, add a regression test for
 empty input, and fix it.” Bund streams progress, previews patches and requests
 approval for host commands. In the query box, press **1** to approve once,
-**2** to deny, or **3** to tell Bund what to do instead.
+**2** to approve for this session, or **3** to tell Bund what to do differently.
 
 API credentials and models are unnecessary for help, listing sessions, or local
 inspection. `bund` can open without credentials; configure a model before
@@ -100,18 +100,27 @@ this shortcut without closing the interface.
 | `/accept-edits on\|off` | Control direct-edit approvals for this session |
 | `/exit` | Show the two-press Ctrl+C exit shortcut |
 
-Approval choices appear inside the query box: **1 Approve once**, **2 Deny**,
-and **3 Tell Bund what to do**. Use Up/Down to select a choice and Enter to answer;
-1 and 2 also answer immediately. The last choice is an inline input with a gray
-placeholder: arrow down to it or press 3, then start typing. Enter declines the
-proposed action and sends the guidance to Bund. Up from the first line or Esc
-returns to the choices without losing the guidance; Down focuses it again.
-Your original draft and cursor return after the decision or
-cancellation. Ctrl+Y/Ctrl+N remain shortcuts for approve/deny from the choices.
+Approval choices appear inside the query box: **1 Approve once**,
+**2 Approve for this session**, and **3 Tell Bund what to do differently**.
+Use Up/Down to select a choice and Enter to answer; 1 and 2 also approve
+immediately. The final choice is a gray placeholder in an inline input. Arrow
+down to it or press 3 and start typing. Enter in the input declines the proposed
+action and sends the guidance to Bund. Up from the first line or Esc returns to
+the session-approval choice without
+losing the guidance; Down focuses it again.
+Your original draft and cursor return after the decision or cancellation.
+Ctrl+Y approves once; Ctrl+N or Esc from the choices denies without feedback.
 While an approval is pending, the mouse wheel and PageUp/PageDown scroll its
-preview in the middle of the screen; Ctrl+O still toggles activity. Exiting restores your previous terminal
-screen. Use `bund sessions` and `bund resume SESSION_ID` to revisit saved
-conversations.
+preview in the middle of the screen; Ctrl+O still toggles activity. Exiting
+restores your previous terminal screen. Use `bund sessions` and
+`bund resume SESSION_ID` to revisit saved conversations.
+
+For a workspace edit, **Approve for this session** allows later workspace edits
+in that saved session. For a command, it allows only the exact command and
+working directory you reviewed; different commands or directories still need
+approval. These grants survive resuming the same session ID and do not carry
+into a new session or change user configuration. Plan mode still blocks edits
+and shell commands. Use `/accept-edits off` to restore edit approvals.
 
 Project `AGENTS.md`
 guidance loads by directory scope; `CLAUDE.md` is the fallback at a directory

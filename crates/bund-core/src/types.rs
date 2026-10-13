@@ -341,6 +341,23 @@ pub struct Policy {
     pub accept_edits: bool,
     /// Full exact command strings, never prefixes or model-supplied grants.
     pub allowed_commands: Vec<String>,
+    /// Exact command and normalized workspace-relative directory grants saved
+    /// only for this session. These never authorize prefixes or other sessions.
+    #[serde(default)]
+    pub session_commands: Vec<CommandGrant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandGrant {
+    pub command: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionApprovalScope {
+    WorkspaceEdits,
+    Command { command: String, cwd: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +388,8 @@ pub struct ApprovalRequest {
     pub preview: String,
     pub fingerprint: String,
     pub workspace: PathBuf,
+    #[serde(default)]
+    pub session_scope: Option<SessionApprovalScope>,
 }
 
 /// Maximum UTF-8 byte length of user guidance attached to a denied approval.
@@ -380,6 +399,7 @@ pub const MAX_APPROVAL_FEEDBACK_BYTES: usize = 16 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     ApproveOnce,
+    ApproveSession,
     Deny,
     DenyWithFeedback { feedback: String },
 }

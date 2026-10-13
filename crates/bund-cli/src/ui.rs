@@ -53,7 +53,7 @@ const COMMANDS: &[&str] = &[
 const EXIT_WINDOW: Duration = Duration::from_millis(1500);
 const EXIT_CONFIRM: &str = "Press Ctrl+C again to exit";
 const EXIT_INSTRUCTION: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
-const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Up/Down chooses; Enter confirms. Arrow down to the gray Tell Bund what to do field and type guidance; Enter sends it. Up from its first line or Esc returns to choices without losing guidance. 1/2 approve/deny; 3 focuses guidance. Ctrl+Y/Ctrl+N still approve/deny from the choices.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
+const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Up/Down chooses; Enter confirms. Arrow down to the gray Tell Bund what to do field and type guidance; Enter sends it. Up from its first line or Esc returns to choices without losing guidance. 1 approves once; 2 approves for this session; 3 focuses Tell Bund what to do differently. Enter sends guidance and skips the proposed action. Session approval covers workspace edits or only the exact command in its directory. Ctrl+Y/Ctrl+N still approve/deny from the choices.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
 
 /// One state owner keeps drafts independent from streaming and approval controls.
 struct Screen {
@@ -424,11 +424,16 @@ impl Screen {
             let mut editor = TextArea::default();
             editor.set_cursor_line_style(Style::default());
             editor.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
-            editor.set_placeholder_text("Tell Bund what to do");
+            editor.set_placeholder_text("Tell Bund what to do differently");
             editor.set_placeholder_style(Style::default().fg(Color::DarkGray));
             editor
         });
         self.hint = "Enter sends guidance · Alt+Enter newline · Esc returns to choices".into();
+    }
+    fn session_approval_available(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|request| request.session_scope.is_some())
     }
     fn select_approval(&mut self, choice: ApprovalChoice) {
         self.approval_selected = choice;
@@ -684,7 +689,9 @@ impl Screen {
         let action = |choice, text: &'static str| {
             Span::styled(
                 text,
-                if self.approval_selected == choice {
+                if choice == ApprovalChoice::Session && !self.session_approval_available() {
+                    Style::default().fg(Color::DarkGray)
+                } else if self.approval_selected == choice {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
@@ -703,13 +710,10 @@ impl Screen {
         if input.height == 1 && !focused {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    action(ApprovalChoice::Approve, "1 Approve"),
+                    action(ApprovalChoice::Approve, "1 Once"),
                     Span::raw(" "),
-                    action(ApprovalChoice::Deny, "2 Deny"),
-                    Span::styled(
-                        " 3 Tell Bund what to do",
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    action(ApprovalChoice::Session, "2 Session"),
+                    Span::styled(" 3 Give instructions", Style::default().fg(Color::DarkGray)),
                 ])),
                 input,
             );
@@ -722,15 +726,15 @@ impl Screen {
                     action(ApprovalChoice::Approve, "1 Approve once"),
                 ]),
                 Line::from(vec![
-                    Span::raw(marker(ApprovalChoice::Deny)),
-                    action(ApprovalChoice::Deny, "2 Deny"),
+                    Span::raw(marker(ApprovalChoice::Session)),
+                    action(ApprovalChoice::Session, "2 Approve for this session"),
                 ]),
             ]
         } else if input.height == 2 {
             vec![Line::from(vec![
-                action(ApprovalChoice::Approve, "1 Approve"),
+                action(ApprovalChoice::Approve, "1 Once"),
                 Span::raw(" · "),
-                action(ApprovalChoice::Deny, "2 Deny"),
+                action(ApprovalChoice::Session, "2 Session"),
             ])]
         } else {
             Vec::new()
@@ -769,7 +773,8 @@ impl Screen {
             frame.render_widget(&*editor, field);
         } else {
             frame.render_widget(
-                Paragraph::new("Tell Bund what to do").style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new("Tell Bund what to do differently")
+                    .style(Style::default().fg(Color::DarkGray)),
                 field,
             );
             if focused && !field.is_empty() {
@@ -847,10 +852,11 @@ fn policy_status(policy: &Policy) -> String {
     } else {
         "reviewed"
     };
-    let grants = if policy.allowed_commands.is_empty() {
+    let grant_count = policy.allowed_commands.len() + policy.session_commands.len();
+    let grants = if grant_count == 0 {
         String::new()
     } else {
-        format!(" ({} exact grants)", policy.allowed_commands.len())
+        format!(" ({grant_count} exact grants)")
     };
     format!("Act · edits {edits} · shell reviewed{grants}")
 }
@@ -1518,6 +1524,18 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         if key.kind != KeyEventKind::Press && key.code == KeyCode::Enter {
             return Ok(false);
         }
+        if screen.approval_selected != ApprovalChoice::Feedback
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('n')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            if key.kind == KeyEventKind::Press {
+                handle.answer_approval(&id, ApprovalDecision::Deny).await?;
+                screen.approval_feedback = None;
+                screen.pending = None;
+            }
+            return Ok(false);
+        }
         if screen.approval_selected == ApprovalChoice::Feedback {
             let editor = screen
                 .approval_feedback
@@ -1525,10 +1543,18 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
                 .expect("focused guidance editor");
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => {
-                    screen.select_approval(ApprovalChoice::Deny);
+                    screen.select_approval(if screen.session_approval_available() {
+                        ApprovalChoice::Session
+                    } else {
+                        ApprovalChoice::Approve
+                    });
                 }
                 (KeyCode::Up, mods) if mods.is_empty() && editor.cursor().0 == 0 => {
-                    screen.select_approval(ApprovalChoice::Deny);
+                    screen.select_approval(if screen.session_approval_available() {
+                        ApprovalChoice::Session
+                    } else {
+                        ApprovalChoice::Approve
+                    });
                 }
                 (KeyCode::Enter, mods)
                     if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
@@ -1554,7 +1580,7 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
                     screen.approval_feedback = None;
                     screen.pending = None;
                     screen.hint =
-                        "Guidance sent · proposed action denied · original draft restored".into();
+                        "Guidance sent · proposed action skipped · original draft restored".into();
                 }
                 _ => {
                     editor.input(key);
@@ -1562,8 +1588,10 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
             }
         } else if matches!(key.code, KeyCode::Up | KeyCode::Down) && key.modifiers.is_empty() {
             let choice = match (screen.approval_selected, key.code) {
-                (ApprovalChoice::Approve, KeyCode::Down) => ApprovalChoice::Deny,
-                (ApprovalChoice::Deny, KeyCode::Down) => ApprovalChoice::Feedback,
+                (ApprovalChoice::Approve, KeyCode::Down) if screen.session_approval_available() => {
+                    ApprovalChoice::Session
+                }
+                (_, KeyCode::Down) => ApprovalChoice::Feedback,
                 (_, KeyCode::Up) => ApprovalChoice::Approve,
                 _ => screen.approval_selected,
             };
@@ -1575,7 +1603,13 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         } {
             let decision = match choice {
                 ApprovalChoice::Approve => Some(ApprovalDecision::ApproveOnce),
-                ApprovalChoice::Deny => Some(ApprovalDecision::Deny),
+                ApprovalChoice::Session => {
+                    anyhow::ensure!(
+                        screen.session_approval_available(),
+                        "Session approval is unavailable for this action; choose Approve once."
+                    );
+                    Some(ApprovalDecision::ApproveSession)
+                }
                 ApprovalChoice::Feedback => {
                     screen.start_approval_feedback();
                     None
@@ -1636,7 +1670,7 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalChoice {
     Approve,
-    Deny,
+    Session,
     Feedback,
 }
 
@@ -1646,15 +1680,11 @@ fn approval_key(key: KeyEvent) -> Option<ApprovalChoice> {
     }
     match key.code {
         KeyCode::Char('1') if key.modifiers.is_empty() => Some(ApprovalChoice::Approve),
-        KeyCode::Char('2') if key.modifiers.is_empty() => Some(ApprovalChoice::Deny),
+        KeyCode::Char('2') if key.modifiers.is_empty() => Some(ApprovalChoice::Session),
         KeyCode::Char('3') if key.modifiers.is_empty() => Some(ApprovalChoice::Feedback),
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(ApprovalChoice::Approve)
         }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalChoice::Deny)
-        }
-        KeyCode::Esc => Some(ApprovalChoice::Deny),
         _ => None,
     }
 }
@@ -2109,11 +2139,17 @@ mod tests {
 
     #[tokio::test]
     async fn numbered_and_arrow_choices_approve_or_deny_only_the_pending_action() {
-        for (keys, approved) in [
-            (vec![KeyCode::Char('1')], true),
-            (vec![KeyCode::Char('2')], false),
-            (vec![KeyCode::Down, KeyCode::Up, KeyCode::Enter], true),
-            (vec![KeyCode::Down, KeyCode::Enter], false),
+        for (keys, approved, session) in [
+            (vec![KeyCode::Char('1')], true, false),
+            (vec![KeyCode::Char('2')], true, true),
+            (vec![KeyCode::Esc], false, false),
+            (
+                vec![KeyCode::Down, KeyCode::Up, KeyCode::Enter],
+                true,
+                false,
+            ),
+            (vec![KeyCode::Down, KeyCode::Enter], true, true),
+            (vec![KeyCode::Down, KeyCode::Esc], false, false),
         ] {
             let (handle, workspace, _data) = exit_fixture().await;
             let mut events = handle.attach().await.unwrap().events;
@@ -2135,6 +2171,32 @@ mod tests {
             .await
             .unwrap();
             screen.set_draft("saved draft");
+            if keys == [KeyCode::Char('1')] {
+                let scope = screen.pending.as_mut().unwrap().session_scope.take();
+                assert!(key_action(
+                    &handle,
+                    &mut screen,
+                    KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+                )
+                .await
+                .is_err());
+                assert!(screen.pending.is_some());
+                assert!(!workspace.path().join("decision.txt").exists());
+                key_action(
+                    &handle,
+                    &mut screen,
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    screen.approval_selected,
+                    ApprovalChoice::Feedback,
+                    "unsupported session approval is skipped"
+                );
+                screen.pending.as_mut().unwrap().session_scope = scope;
+                screen.select_approval(ApprovalChoice::Approve);
+            }
             for key in keys {
                 key_action(&handle, &mut screen, KeyEvent::new(key, KeyModifiers::NONE))
                     .await
@@ -2154,6 +2216,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(workspace.path().join("decision.txt").exists(), approved);
+            assert_eq!(
+                handle.snapshot().await.unwrap().policy.accept_edits,
+                session
+            );
             assert_eq!(screen.draft(), "saved draft");
         }
     }
@@ -2200,9 +2266,9 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| screen.render(frame)).unwrap();
         assert!(buffer_row(terminal.backend(), 20).contains("1 Approve once"));
-        assert!(buffer_row(terminal.backend(), 21).contains("2 Deny"));
+        assert!(buffer_row(terminal.backend(), 21).contains("2 Approve for this session"));
         assert!(
-            buffer_row(terminal.backend(), 22).contains("3 Tell Bund what to do"),
+            buffer_row(terminal.backend(), 22).contains("3 Tell Bund what to do differently"),
             "{}",
             buffer_row(terminal.backend(), 22)
         );
@@ -2230,8 +2296,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(screen.approval_selected, ApprovalChoice::Deny);
-        screen.paste("ignored while on Deny");
+        assert_eq!(screen.approval_selected, ApprovalChoice::Session);
+        screen.paste("ignored while on session approval");
         key_action(
             &handle,
             &mut screen,
@@ -2250,11 +2316,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(screen.approval_selected, ApprovalChoice::Deny);
+        assert_eq!(screen.approval_selected, ApprovalChoice::Session);
         assert_eq!(
             screen.approval_feedback.as_ref().unwrap().lines(),
             &["use option 1"]
         );
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(screen.approval_selected, ApprovalChoice::Feedback);
         assert!(
             screen.pending.is_some(),
             "Esc from guidance returns to the menu"
@@ -2340,6 +2414,7 @@ mod tests {
             preview: "exact proposed patch".into(),
             fingerprint: "fixture".into(),
             workspace: PathBuf::from("."),
+            session_scope: Some(bund_core::SessionApprovalScope::WorkspaceEdits),
         });
         for (width, height) in [
             (80, 24),
@@ -2365,15 +2440,20 @@ mod tests {
                 .map(|row| buffer_row(terminal.backend(), row))
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(
-                controls.contains("1 Approve"),
-                "{width}x{height}: {controls}"
-            );
-            assert!(controls.contains("2 Deny"), "{width}x{height}: {controls}");
-            assert!(
-                controls.contains("3 Tell Bund what to do"),
-                "{width}x{height}: {controls}"
-            );
+            let labels = if height == 1 {
+                ["1 Once", "2 Session", "3 Give instructions"]
+            } else if height == 2 {
+                ["1 Once", "2 Session", "3 Tell Bund what to do differently"]
+            } else {
+                [
+                    "1 Approve once",
+                    "2 Approve for this session",
+                    "3 Tell Bund what to do differently",
+                ]
+            };
+            for label in labels {
+                assert!(controls.contains(label), "{width}x{height}: {controls}");
+            }
             assert_eq!(screen.draft(), "Keep this draft\nsecond line");
             if height >= 16 {
                 assert!(
@@ -2672,10 +2752,19 @@ mod tests {
             mode: Mode::Act,
             accept_edits: true,
             allowed_commands: vec!["cargo test".into()],
+            ..Policy::default()
         };
         assert_eq!(
             policy_status(&policy),
             "Act · edits auto · shell reviewed (1 exact grants)"
+        );
+        policy.session_commands.push(bund_core::CommandGrant {
+            command: "cargo check".into(),
+            cwd: "crate".into(),
+        });
+        assert_eq!(
+            policy_status(&policy),
+            "Act · edits auto · shell reviewed (2 exact grants)"
         );
         policy.mode = Mode::Plan;
         assert_eq!(
@@ -2685,6 +2774,7 @@ mod tests {
         policy.mode = Mode::Act;
         policy.accept_edits = false;
         policy.allowed_commands.clear();
+        policy.session_commands.clear();
         assert_eq!(
             policy_status(&policy),
             "Act · edits reviewed · shell reviewed"
@@ -2702,11 +2792,11 @@ mod tests {
         );
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(ApprovalChoice::Deny)
+            None
         );
         for (number, choice) in [
             ('1', ApprovalChoice::Approve),
-            ('2', ApprovalChoice::Deny),
+            ('2', ApprovalChoice::Session),
             ('3', ApprovalChoice::Feedback),
         ] {
             let mut key = KeyEvent::new(KeyCode::Char(number), KeyModifiers::NONE);

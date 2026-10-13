@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 enum FailurePoint {
     ToolOutput,
     ToolStarted,
+    SessionGrant,
 }
 
 struct FaultStore {
@@ -47,6 +48,7 @@ impl SessionStore for FaultStore {
                 (&self.point, &event.kind),
                 (FailurePoint::ToolOutput, EventKind::ToolOutput { .. })
                     | (FailurePoint::ToolStarted, EventKind::ToolStarted { .. })
+                    | (FailurePoint::SessionGrant, EventKind::SettingsChanged)
             )
         });
         let first_failure = trigger && !self.failed.swap(true, Ordering::SeqCst);
@@ -250,6 +252,7 @@ async fn fault_run(point: FailurePoint, persistent: bool) {
                                 "failed start record must prevent side effects"
                             );
                         }
+                        FailurePoint::SessionGrant => unreachable!("separate grant fixture"),
                     }
                     break;
                 }
@@ -300,4 +303,83 @@ async fn transient_output_commit_failure_still_reports_failure_after_cleanup() {
 #[tokio::test]
 async fn transient_tool_started_commit_failure_does_not_continue_tools() {
     fault_run(FailurePoint::ToolStarted, false).await;
+}
+
+#[tokio::test]
+async fn failed_session_grant_commit_rolls_back_memory_and_never_starts_action() {
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("file");
+    std::fs::write(&file, "original").unwrap();
+    let store = Arc::new(FaultStore {
+        inner: SqliteStore::open(data.path()).unwrap(),
+        point: FailurePoint::SessionGrant,
+        failed: AtomicBool::new(false),
+        persistent: false,
+    });
+    let agent = Engine::new(EngineDependencies {
+        providers: vec![],
+        tools: bund_tools::built_in_tools(),
+        store: store.clone(),
+    })
+    .unwrap();
+    let session = agent
+        .create_session(SessionOptions::new(
+            workspace.path().into(),
+            ModelProfile::new("offline", "fixture"),
+        ))
+        .await
+        .unwrap();
+    for decision in [ApprovalDecision::ApproveSession, ApprovalDecision::Deny] {
+        let mut events = session.attach().await.unwrap().events;
+        session
+            .run_tool("apply_patch", json!({"path":"file","content":"changed"}))
+            .await
+            .unwrap();
+        let mut approvals = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap().kind {
+                    EventKind::ApprovalRequired(request) => {
+                        approvals += 1;
+                        session
+                            .answer_approval(&request.id, decision.clone())
+                            .await
+                            .unwrap();
+                    }
+                    EventKind::ToolStarted { .. } => {
+                        panic!("failed grant or denied retry must not execute")
+                    }
+                    EventKind::SettingsChanged => {
+                        panic!("failed grant must not publish authorization")
+                    }
+                    EventKind::RunFinished { status, .. } => {
+                        assert_eq!(status, RunStatus::Failed);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("grant failure must terminate");
+        assert_eq!(
+            approvals, 1,
+            "grant failure must leave the next action requiring approval"
+        );
+        let snapshot = session.snapshot().await.unwrap();
+        assert!(!snapshot.policy.accept_edits);
+        assert!(snapshot.policy.session_commands.is_empty());
+        assert!(
+            !store
+                .load(&snapshot.id)
+                .await
+                .unwrap()
+                .options
+                .policy
+                .accept_edits
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+    }
+    assert!(store.failed.load(Ordering::SeqCst));
 }
