@@ -102,20 +102,25 @@ stops instead of silently dropping required context.
 ## Terminal boundary
 
 One Crossterm event source and one fullscreen Ratatui renderer own the terminal.
-The interactive client enters the alternate screen and restores the original
-screen and terminal modes on exit. Workspace, model, status, and keyboard hints
+The interactive client enters the alternate screen, captures mouse input for
+its own history navigation, and restores the original screen, mouse handling,
+and terminal modes on exit. Workspace, model, status, and keyboard hints
 stay at the top; the query box stays at the bottom. Approval controls occupy a
 pinned strip, with a scrollable review preview in the middle. The composer
-survives streaming, expansion, resize, and approval requests.
+survives streaming, expansion, resize, and approval requests. Interactive exit
+requires two consecutive Ctrl+C presses within 1.5 seconds. The first cancels
+active work while retaining the draft; other input or expiry resets the
+confirmation. Ctrl+D and `/exit` display the exit shortcut. This does not change
+headless cancellation.
 
 The conversation is retained application state, not text appended to native
 scrollback. Ordered session events reconstruct response text, tool activity,
 and provider-supplied reasoning summaries on resume. Completed responses
 reconcile streamed progress in place. Ctrl+O changes the same transcript's
 layout, revealing orange activity boxes beneath their responses; a stable
-message anchor preserves the reader's position. PageUp/PageDown stop following
-new output, and Ctrl+End resumes following. Pending approvals take priority over
-ordinary transcript scrolling.
+message anchor preserves the reader's position. The mouse wheel and
+PageUp/PageDown stop following new output, and Ctrl+End resumes following.
+Pending approvals take priority over ordinary transcript scrolling.
 
 Model and process output is sanitized before display. Opaque provider
 continuation, signatures, and encrypted reasoning remain outside the visible

@@ -8,7 +8,10 @@ use bund_core::{
     SessionHandle, SessionSnapshot, Transcript,
 };
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    },
     execute,
 };
 use ratatui::{
@@ -24,7 +27,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[path = "ui_render.rs"]
 mod render;
@@ -41,9 +44,11 @@ const COMMANDS: &[&str] = &[
     "/check",
     "/skill",
     "/accept-edits",
-    "/exit",
 ];
-const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off /exit\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc or Ctrl+C cancels work. Approval: Ctrl+Y approves once; Ctrl+N or Esc denies.\nCtrl+O expands activity; PgUp/PgDn scroll; Ctrl+End returns to latest output.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
+const EXIT_WINDOW: Duration = Duration::from_millis(1500);
+const EXIT_CONFIRM: &str = "Press Ctrl+C again to exit";
+const EXIT_INSTRUCTION: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
+const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Ctrl+Y approves once; Ctrl+N or Esc denies.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
 
 /// One state owner keeps drafts independent from streaming and approval controls.
 struct Screen {
@@ -63,6 +68,7 @@ struct Screen {
     history_ceiling: Option<u64>,
     history_task: Option<tokio::task::JoinHandle<Result<HistoryLoad>>>,
     history_follow_pending: bool,
+    exit_armed_at: Option<Instant>,
     hint: String,
     notices: VecDeque<String>,
     history: History,
@@ -90,6 +96,41 @@ impl Drop for Screen {
 }
 
 impl Screen {
+    fn reset_exit_confirmation(&mut self) {
+        self.exit_armed_at = None;
+    }
+
+    fn expire_exit_confirmation(&mut self) -> bool {
+        if self
+            .exit_armed_at
+            .is_some_and(|at| at.elapsed() > EXIT_WINDOW)
+        {
+            self.reset_exit_confirmation();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn confirm_exit_at(&mut self, now: Instant) -> bool {
+        let confirmed = self
+            .exit_armed_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= EXIT_WINDOW);
+        self.exit_armed_at = if confirmed { None } else { Some(now) };
+        confirmed
+    }
+
+    fn display_hint(&self) -> &str {
+        if self
+            .exit_armed_at
+            .is_some_and(|at| at.elapsed() <= EXIT_WINDOW)
+        {
+            EXIT_CONFIRM
+        } else {
+            &self.hint
+        }
+    }
+
     fn build_document(&self, width: usize) -> Document {
         use bund_core::{ResponsePurpose, TranscriptToolStatus};
         let mut document = Document::default();
@@ -349,6 +390,7 @@ impl Screen {
             history_ceiling: None,
             history_task: None,
             history_follow_pending: false,
+            exit_armed_at: None,
             hint: "Enter send · Alt+Enter newline · /help".into(),
             notices: VecDeque::new(),
             history,
@@ -424,16 +466,26 @@ impl Screen {
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
-            Line::styled(clean(&self.hint), Style::default().fg(Color::Cyan)),
+            Line::styled(clean(self.display_hint()), Style::default().fg(Color::Cyan)),
         ];
-        let headings = if header.height == 1 {
+        let mut headings = if header.height == 1 {
             vec![Line::from(clean(&format!(
                 "Bund · {:?}{} · {}",
-                self.snapshot.status, view, self.hint
+                self.snapshot.status,
+                view,
+                self.display_hint()
             )))]
         } else {
             headings
         };
+        // Confirmation must stay visible when optional header rows are cropped.
+        if header.height > 0
+            && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+        {
+            let row = (header.height as usize).min(headings.len()) - 1;
+            headings[row] =
+                Line::styled(clean(self.display_hint()), Style::default().fg(Color::Cyan));
+        }
         frame.render_widget(Paragraph::new(headings), header);
         self.viewport_height = conversation.height as usize;
         if let Some(request) = &self.pending {
@@ -520,11 +572,16 @@ impl Screen {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan));
         if composer.height >= 3 && composer.width >= 3 {
-            block = block.title(if self.pending.is_some() {
+            let title = if header.height == 0
+                && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+            {
+                self.display_hint()
+            } else if self.pending.is_some() {
                 " Ask bund · draft paused "
             } else {
                 " Ask bund "
-            });
+            };
+            block = block.title(title);
         }
         let input = block.inner(composer);
         frame.render_widget(block, composer);
@@ -546,9 +603,20 @@ impl Screen {
                 frame.render_widget(&self.editor, input);
             }
         }
+        if header.height == 0
+            && composer.height > 0
+            && composer.height < 3
+            && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
+        {
+            // With only one or two rows available there is no header or title;
+            // temporarily show confirmation without changing the stored draft.
+            frame.render_widget(
+                Paragraph::new(clean(self.display_hint())).style(Style::default().fg(Color::Cyan)),
+                Rect::new(composer.x, composer.y, composer.width, 1),
+            );
+        }
     }
-    fn move_page(&mut self, down: bool) {
-        let step = self.viewport_height.saturating_sub(1).max(1);
+    fn move_rows(&mut self, down: bool, step: usize) {
         if self.pending.is_some() {
             self.approval_scroll = if down {
                 self.approval_scroll.saturating_add(step)
@@ -640,7 +708,11 @@ fn policy_status(policy: &Policy) -> String {
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -682,7 +754,7 @@ async fn run_inner(
     load_latest(&handle, &mut screen);
     let _guard = TerminalGuard;
     let mut terminal = ratatui::try_init()?;
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     if let Some(prompt) = first_prompt {
         screen.set_draft(&prompt);
         if let Err(error) = submit(&handle, &mut screen).await {
@@ -693,12 +765,19 @@ async fn run_inner(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending_events = VecDeque::new();
     let mut dirty = true;
-    let shutdown = shutdown_signal();
+    let shutdown = termination_signal();
     tokio::pin!(shutdown);
+    let mut interrupt = InterruptListener::new()?;
     'ui: loop {
         tokio::select! {
             _ = &mut shutdown => { handle.cancel().await?; break; },
+            signal = interrupt.recv() => {
+                signal?;
+                if request_exit(&handle, &mut screen).await? { break; }
+                dirty = true;
+            },
             _ = ticker.tick() => {
+                dirty |= screen.expire_exit_confirmation();
                 // One owner handles terminal input and drawing. Bound each batch
                 // so paste/output bursts cannot starve cancellation or approvals.
                 for _ in 0..32 {
@@ -712,7 +791,21 @@ async fn run_inner(
                             }
                             dirty = true;
                         },
-                        Event::Paste(text) if screen.pending.is_none() => { screen.editor.insert_str(clean(&text)); dirty = true; },
+                        Event::Paste(text) => {
+                            screen.reset_exit_confirmation();
+                            if screen.pending.is_none() { screen.editor.insert_str(clean(&text)); }
+                            dirty = true;
+                        },
+                        Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved => {
+                            screen.reset_exit_confirmation();
+                            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                                if let Err(error) = scroll_history(&handle, &mut screen, mouse.kind == MouseEventKind::ScrollDown, 3).await {
+                                    screen.hint = error.to_string();
+                                    screen.notice(error.to_string());
+                                }
+                            }
+                            dirty = true;
+                        },
                         Event::Resize(_, _) => dirty = true,
                         _ => {},
                     }
@@ -922,8 +1015,18 @@ async fn forward_history(handle: &SessionHandle, after: u64, latest: u64) -> Res
 }
 
 async fn page_history(handle: &SessionHandle, screen: &mut Screen, down: bool) -> Result<()> {
+    let step = screen.viewport_height.saturating_sub(1).max(1);
+    scroll_history(handle, screen, down, step).await
+}
+
+async fn scroll_history(
+    handle: &SessionHandle,
+    screen: &mut Screen,
+    down: bool,
+    step: usize,
+) -> Result<()> {
     if screen.pending.is_some() {
-        screen.move_page(down);
+        screen.move_rows(down, step);
         return Ok(());
     }
     if screen.history_task.is_some() {
@@ -988,21 +1091,63 @@ async fn page_history(handle: &SessionHandle, screen: &mut Screen, down: bool) -
             return Ok(());
         }
     }
-    screen.move_page(down);
+    screen.move_rows(down, step);
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn termination_signal() {
     #[cfg(unix)]
     {
         if let Ok(mut terminate) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
-            tokio::select! { _ = terminate.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+            terminate.recv().await;
             return;
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
+    std::future::pending::<()>().await;
+}
+
+/// Keep the subscription alive while input, rendering, and journal work run.
+struct InterruptListener {
+    #[cfg(unix)]
+    receiver: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    receiver: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>,
+}
+
+impl InterruptListener {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let receiver = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        #[cfg(not(unix))]
+        let receiver = Box::pin(tokio::signal::ctrl_c());
+        Ok(Self { receiver })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.receiver
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("interrupt signal stream closed"))
+        }
+        #[cfg(not(unix))]
+        {
+            let result = self.receiver.as_mut().await;
+            self.receiver = Box::pin(tokio::signal::ctrl_c());
+            result
+        }
+    }
+}
+
+async fn request_exit(handle: &SessionHandle, screen: &mut Screen) -> Result<bool> {
+    let confirmed = screen.confirm_exit_at(Instant::now());
+    // Cancellation never clears the composer. Confirmation remains armed while
+    // cancellation/status events update the ordinary hint beneath its overlay.
+    handle.cancel().await?;
+    Ok(confirmed)
 }
 
 async fn process_event(
@@ -1085,7 +1230,32 @@ async fn apply_event(
 }
 
 async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+    use crossterm::event::KeyEventKind;
+    if key.kind == KeyEventKind::Release {
+        return Ok(false);
+    }
+    if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return if key.kind == KeyEventKind::Press {
+            request_exit(handle, screen).await
+        } else {
+            // Ignore repeats when the terminal identifies them.
+            Ok(false)
+        };
+    }
+    screen.reset_exit_confirmation();
     match (key.code, key.modifiers) {
+        (KeyCode::Char('d'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+            screen.hint = EXIT_INSTRUCTION.into();
+            return Ok(false);
+        }
+        (KeyCode::Enter, mods)
+            if !mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                && screen.draft().trim() == "/exit" =>
+        {
+            screen.hint = EXIT_INSTRUCTION.into();
+            return Ok(false);
+        }
         (KeyCode::Char('o'), mods) if mods.contains(KeyModifiers::CONTROL) => {
             screen.expanded = !screen.expanded;
             screen.document_dirty = true;
@@ -1111,8 +1281,6 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         if let Some(decision) = approval_key(key) {
             handle.answer_approval(&request.id, decision).await?;
             screen.pending = None;
-        } else if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            handle.cancel().await?;
         }
         return Ok(false);
     }
@@ -1121,24 +1289,8 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
             if screen.snapshot.status.is_active() {
                 handle.cancel().await?;
             } else {
-                screen.hint = "Enter sends your draft · /exit quits".into();
+                screen.hint = format!("Enter sends your draft · {EXIT_INSTRUCTION}");
             }
-        }
-        (KeyCode::Char('c'), mods) if mods.contains(KeyModifiers::CONTROL) => {
-            if screen.snapshot.status.is_active() {
-                handle.cancel().await?;
-            } else if screen.draft().is_empty() {
-                return Ok(true);
-            } else {
-                screen.set_draft("");
-                screen.hint = "Draft cleared · Ctrl+C again exits".into();
-            }
-        }
-        (KeyCode::Char('d'), mods)
-            if mods.contains(KeyModifiers::CONTROL) && screen.draft().is_empty() =>
-        {
-            handle.cancel().await?;
-            return Ok(true);
         }
         (KeyCode::Enter, mods)
             if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT) =>
@@ -1150,10 +1302,6 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         }
         (KeyCode::Enter, _) => {
             let draft = screen.draft();
-            if draft.trim() == "/exit" {
-                handle.cancel().await?;
-                return Ok(true);
-            }
             if draft.trim() == "/help" {
                 screen.notice(HELP.into());
                 screen.set_draft("");
@@ -1197,6 +1345,10 @@ async fn submit(handle: &SessionHandle, screen: &mut Screen) -> Result<()> {
     let draft = screen.draft();
     let text = draft.trim();
     if text.is_empty() {
+        return Ok(());
+    }
+    if text == "/exit" {
+        screen.hint = EXIT_INSTRUCTION.into();
         return Ok(());
     }
     if screen.snapshot.status.is_active() {
@@ -1456,6 +1608,176 @@ mod tests {
             .collect()
     }
 
+    async fn exit_fixture() -> (SessionHandle, tempfile::TempDir, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(bund_store::SqliteStore::open(data.path()).unwrap());
+        let engine = bund_core::Engine::new(bund_core::EngineDependencies {
+            providers: vec![],
+            tools: bund_tools::built_in_tools(),
+            store,
+        })
+        .unwrap();
+        let handle = engine
+            .create_session(bund_core::SessionOptions::new(
+                workspace.path().into(),
+                bund_core::ModelProfile::new("fixture", "offline"),
+            ))
+            .await
+            .unwrap();
+        (handle, workspace, data)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[tokio::test]
+    async fn exit_requires_two_consecutive_presses_and_preserves_empty_or_nonempty_drafts() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        for draft in ["", "keep this draft\nand its newline"] {
+            let mut screen = test_screen();
+            screen.set_draft(draft);
+            assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+            assert_eq!(screen.draft(), draft);
+            assert_eq!(screen.display_hint(), EXIT_CONFIRM);
+            // Asynchronous status updates cannot hide the confirmation hint.
+            screen.hint = "Cancelled; edits remain".into();
+            assert_eq!(screen.display_hint(), EXIT_CONFIRM);
+            assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+            assert_eq!(screen.draft(), draft);
+        }
+    }
+
+    #[tokio::test]
+    async fn intervening_input_and_autorepeat_cannot_confirm_exit() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        let mut repeat = ctrl_c();
+        repeat.kind = crossterm::event::KeyEventKind::Repeat;
+        assert!(!key_action(&handle, &mut screen, repeat).await.unwrap());
+        assert!(screen.exit_armed_at.is_some());
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert!(screen.exit_armed_at.is_none());
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        // Paste and mouse handlers use this same reset operation.
+        screen.reset_exit_confirmation();
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        let mut release = ctrl_c();
+        release.kind = crossterm::event::KeyEventKind::Release;
+        assert!(!key_action(&handle, &mut screen, release).await.unwrap());
+        assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        assert_eq!(screen.draft(), "x");
+    }
+
+    #[test]
+    fn exit_confirmation_expires_and_late_press_starts_a_new_window() {
+        let mut screen = test_screen();
+        let now = Instant::now();
+        assert!(!screen.confirm_exit_at(now));
+        assert!(!screen.confirm_exit_at(now + EXIT_WINDOW + Duration::from_millis(1)));
+        screen.exit_armed_at = Some(Instant::now() - EXIT_WINDOW - Duration::from_millis(1));
+        assert!(screen.expire_exit_confirmation());
+        assert!(screen.exit_armed_at.is_none());
+        assert_ne!(screen.display_hint(), EXIT_CONFIRM);
+        assert!(!screen.expire_exit_confirmation());
+    }
+
+    #[test]
+    fn exit_confirmation_is_visible_in_short_terminal_headers() {
+        let mut screen = test_screen();
+        screen.set_draft("preserved even in a one-row terminal");
+        screen.confirm_exit_at(Instant::now());
+        for height in [1, 2, 4, 8, 10, 11, 14, 24] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let text = (0..height)
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains(EXIT_CONFIRM),
+                "confirmation missing at height {height}: {text}"
+            );
+            assert_eq!(screen.draft(), "preserved even in a one-row terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_command_and_ctrl_d_only_explain_the_confirmation_shortcut() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        screen.set_draft("/exit");
+        assert!(!key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        )
+        .await
+        .unwrap());
+        assert_eq!(screen.hint, EXIT_INSTRUCTION);
+        assert_eq!(screen.draft(), "/exit");
+        assert!(screen.exit_armed_at.is_none());
+        screen.set_draft("");
+        assert!(!key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+        )
+        .await
+        .unwrap());
+        assert_eq!(screen.hint, EXIT_INSTRUCTION);
+        assert!(screen.exit_armed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn first_exit_press_cancels_pending_work_and_second_exits_during_history_loading() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut events = handle.attach().await.unwrap().events;
+        handle
+            .run_tool("run_command", serde_json::json!({"command":"sleep 5"}))
+            .await
+            .unwrap();
+        let mut screen = test_screen();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let pending = matches!(event.kind, EventKind::ApprovalRequired(_));
+                apply_event(&handle, &mut screen, event).await.unwrap();
+                if pending {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        screen.set_draft("preserve while cancelling");
+        start_history_load(&mut screen, std::future::pending());
+        assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        assert!(screen.pending.is_some());
+        assert_eq!(screen.draft(), "preserve while cancelling");
+        // No approval or cancelled state transition needs to finish first.
+        assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let EventKind::RunFinished { status, .. } = events.recv().await.unwrap().kind {
+                    assert_eq!(status, RunStatus::Cancelled);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(screen.draft(), "preserve while cancelling");
+    }
+
     #[test]
     fn fullscreen_geometry_preserves_top_information_bottom_draft_and_approval() {
         let mut screen = test_screen();
@@ -1609,7 +1931,7 @@ mod tests {
         screen.set_draft("persistent draft");
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| screen.render(frame)).unwrap();
-        screen.move_page(false);
+        screen.move_rows(false, screen.viewport_height.saturating_sub(1).max(1));
         terminal.draw(|frame| screen.render(frame)).unwrap();
         let anchor = screen.anchor.clone().unwrap();
         event(

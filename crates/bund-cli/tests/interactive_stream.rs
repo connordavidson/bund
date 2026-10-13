@@ -25,6 +25,8 @@ const DRAFT: &str = "Continue 世界 e\u{301} 🦀\nkeep this draft";
 const REASONING: &str = "REASONING_ONLY_WHEN_EXPANDED\nInspect the workspace before editing.";
 const LATEST: &str = "NEW_OUTPUT_WHILE_BROWSING";
 const ORANGE: vt100::Color = vt100::Color::Rgb(255, 184, 108);
+const EXIT_CONFIRMATION: &str = "Press Ctrl+C again to exit";
+const EXIT_HELP: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
 const HOSTILE: [&str; 3] = [
     "harmless \u{1b}[",
     "999;999Hvisible-safe\u{1b}]52;c;INERT_CLIPBOARD_MARKER",
@@ -242,7 +244,7 @@ impl Pty {
         command
             .args([
                 "-c",
-                "printf 'PREEXISTING_SCROLLBACK\\n'; \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
+                "printf 'PREEXISTING_SCROLLBACK\\n'; /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$BUND_TEST_PID_FILE\"; exec \"$@\"' bund-pid-wrapper \"$@\"; code=$?; printf '\\nBUND_DONE\\n'; read done; exit \"$code\"",
                 "bund-pty-wrapper",
             ])
             .arg(env!("CARGO_BIN_EXE_bund"))
@@ -265,6 +267,7 @@ impl Pty {
             .env("COLORTERM", "truecolor")
             .env_remove("NO_COLOR")
             .env("OPENAI_API_KEY", "fixture-only-key")
+            .env("BUND_TEST_PID_FILE", dir.join("bund.pid"))
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
@@ -301,6 +304,14 @@ impl Pty {
 
     fn send(&mut self, text: &str) {
         self.master.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn wheel(&mut self, down: bool) {
+        self.send(if down {
+            "\x1b[<65;10;10M"
+        } else {
+            "\x1b[<64;10;10M"
+        });
     }
 
     fn pump(&mut self) {
@@ -345,6 +356,38 @@ impl Pty {
 
     fn wait_visible(&mut self, text: &str) {
         self.wait_screen(text, |screen| screen.contents().contains(text));
+    }
+
+    fn assert_occupied(&self) {
+        let screen = self.screen.screen();
+        assert!(
+            screen.alternate_screen(),
+            "Bund must own the terminal while open"
+        );
+        assert!(
+            !screen.contents().contains("PREEXISTING_SCROLLBACK"),
+            "the prior shell must remain hidden until exit"
+        );
+        assert_ne!(
+            screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "mouse scrolling must be captured by Bund"
+        );
+        assert_eq!(
+            screen.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        assert_eq!(
+            screen.scrollback(),
+            0,
+            "wheel input must not move native shell scrollback"
+        );
+    }
+
+    fn interrupt_once(&mut self) {
+        self.send("\x03");
+        self.wait_visible(EXIT_CONFIRMATION);
+        self.assert_occupied();
     }
 
     fn wait_recorded_text(&mut self, dir: &Path, needle: &str) {
@@ -439,7 +482,13 @@ impl Pty {
     }
 
     fn finish(&mut self) {
-        self.send("/exit\r");
+        // Reset any confirmation left by cancellation, then send exactly two
+        // adjacent presses without depending on scheduling within the 1.5s window.
+        self.send("\x1b[C\x03\x03");
+        self.wait_finished();
+    }
+
+    fn wait_finished(&mut self) {
         self.wait_visible("BUND_DONE");
         assert_eq!(
             self.before,
@@ -449,6 +498,15 @@ impl Pty {
         assert!(
             !self.screen.screen().alternate_screen(),
             "exit must restore the primary screen"
+        );
+        assert_eq!(
+            self.screen.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "exit must disable mouse reporting"
+        );
+        assert_eq!(
+            self.screen.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
         );
         assert!(
             self.screen
@@ -494,11 +552,123 @@ impl Drop for Pty {
 }
 
 #[test]
+fn only_consecutive_interrupts_exit_and_other_input_or_timeout_resets_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut terminal = Pty::spawn(dir.path(), "http://127.0.0.1:1/v1");
+    terminal.wait_composer(None, false);
+    terminal.wait_visible("Latest conversation");
+    terminal.assert_occupied();
+
+    terminal.interrupt_once(); // An empty composer no longer exits on one press.
+    terminal.send("\x04");
+    terminal.wait_visible(EXIT_HELP);
+    terminal.assert_occupied();
+    terminal.send("/exit\r");
+    terminal.wait_composer(Some("/exit"), false);
+    terminal.wait_visible(EXIT_HELP);
+    terminal.assert_occupied();
+    terminal.send(&"\x7f".repeat(5));
+    terminal.wait_visible("Ask bund about this workspace");
+
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.send("!"); // Editing between presses disarms the first press.
+    let edited = format!("{DRAFT}!");
+    terminal.wait_composer(Some(&edited), false);
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+
+    // Await the actual expiry redraw rather than racing a sleep with input.
+    terminal.wait_screen("exit confirmation timeout", |screen| {
+        !screen.contents().contains(EXIT_CONFIRMATION)
+    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+    terminal.wheel(false); // A deliberate scroll also interrupts the sequence.
+    terminal.wait_screen("scroll resets exit confirmation", |screen| {
+        !screen.contents().contains(EXIT_CONFIRMATION)
+    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some(&edited), false);
+    terminal.finish();
+}
+
+#[test]
+fn operating_system_interrupts_require_confirmation_and_restore_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut terminal = Pty::spawn(dir.path(), "http://127.0.0.1:1/v1");
+    terminal.wait_composer(None, false);
+    terminal.wait_visible("Latest conversation");
+    let pid: nix::libc::pid_t = std::fs::read_to_string(dir.path().join("bund.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1 && pid as u32 != terminal.child.id());
+    let interrupt = || assert_eq!(unsafe { nix::libc::kill(pid, nix::libc::SIGINT) }, 0);
+    interrupt();
+    terminal.wait_visible(EXIT_CONFIRMATION);
+    terminal.assert_occupied();
+    terminal.send("preserved after signal");
+    terminal.wait_composer(Some("preserved after signal"), false);
+    interrupt(); // Input interrupted the prior confirmation sequence.
+    terminal.wait_visible(EXIT_CONFIRMATION);
+    terminal.wait_composer(Some("preserved after signal"), false);
+    terminal.assert_occupied();
+    interrupt(); // A second real signal confirms exit, without targeting the wrapper.
+    terminal.wait_finished();
+}
+
+#[test]
+fn first_interrupt_cancels_pending_approval_without_closing_or_losing_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (advance, gate) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("approval-message", "Preparing approval\n");
+        let first = start("approval-response", &item) + &delta("Preparing approval\n");
+        let call = json!({"type":"function_call","id":"approval-call","call_id":"approval-call",
+            "name":"apply_patch","arguments":json!({"path":"created.txt","content":"unapproved"}).to_string(),
+            "status":"completed"});
+        let completed = finish("approval-response", &[item, call]);
+        header(&mut socket, first.len() + completed.len());
+        socket.write_all(first.as_bytes()).unwrap();
+        socket.flush().unwrap();
+        gate.recv_timeout(WAIT).unwrap();
+        socket.write_all(completed.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("prepare an edit\r");
+    terminal.wait_visible("Preparing approval");
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    advance.send(()).unwrap();
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.interrupt_once();
+    terminal.wait_screen("approval cancelled while Bund remains open", |screen| {
+        screen.contents().contains("Cancelled")
+            && !screen.contents().contains("Approval required: apply_patch")
+    });
+    terminal.wait_composer(Some(DRAFT), false);
+    terminal.assert_occupied();
+    assert!(!dir.path().join("created.txt").exists());
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
 fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture();
     let mut terminal = Pty::spawn(dir.path(), &fixture.endpoint);
     terminal.wait_composer(None, false);
+    terminal.assert_occupied();
     assert!(!terminal
         .screen
         .screen()
@@ -559,6 +729,19 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         screen.rows(0, 90).skip(7).take(12).collect::<Vec<_>>() != review_before
     });
     terminal.wait_composer(Some(DRAFT), true);
+    let review_before_wheel = terminal
+        .screen
+        .screen()
+        .rows(0, 90)
+        .skip(7)
+        .take(12)
+        .collect::<Vec<_>>();
+    terminal.wheel(false);
+    terminal.wait_screen("mouse wheel scrolls approval preview", |screen| {
+        screen.rows(0, 90).skip(7).take(12).collect::<Vec<_>>() != review_before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.wait_composer(Some(DRAFT), true);
     terminal.send("\x0f"); // Activity toggle must remain usable during approval.
     terminal.wait_composer(Some(DRAFT), true);
     terminal.send("\x0f");
@@ -614,13 +797,11 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         screen.contents().contains(LATEST) && !screen.contents().contains("Browsing history")
     });
     terminal.wait_composer(Some("still drafting 世界"), false);
-    terminal.send("\x03"); // Cancel an actual unfinished provider stream.
+    terminal.interrupt_once(); // Cancel without closing or clearing the draft.
     terminal.wait_visible("Cancelled");
+    terminal.wait_composer(Some("still drafting 世界"), false);
+    terminal.assert_occupied();
     fixture.advance.send(()).unwrap();
-    terminal.send("\x03"); // Clear the preserved draft before /exit.
-    terminal.wait_screen("draft cleared", |screen| {
-        !screen.contents().contains("still drafting 世界")
-    });
     terminal.finish();
     fixture.worker.join().unwrap();
 
@@ -830,6 +1011,26 @@ fn saved_conversation_pages_across_windows_without_skipping_turns() {
         seen
     }
 
+    let before_wheel = body(terminal.screen.screen());
+    terminal.wheel(false);
+    terminal.wait_screen("mouse wheel scrolls Bund history", |screen| {
+        screen.contents().contains("Browsing history") && body(screen) != before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.wait_composer(Some("draft survives history paging"), false);
+    let before_wheel = body(terminal.screen.screen());
+    terminal.wheel(true);
+    terminal.wait_screen("mouse wheel scrolls forward", |screen| {
+        body(screen) != before_wheel
+    });
+    terminal.assert_occupied();
+    terminal.send("\x1b[1;5F");
+    terminal.wait_screen("latest after mouse wheel", |screen| {
+        screen.contents().contains("Saved answer 69")
+            && screen.contents().contains("Latest conversation")
+            && !screen.contents().contains("Browsing history")
+    });
+
     let expected: BTreeSet<_> = (0..70).collect();
     assert_eq!(
         visit(&mut terminal, "\x1b[5~", 0),
@@ -848,9 +1049,7 @@ fn saved_conversation_pages_across_windows_without_skipping_turns() {
             && screen.contents().contains("Latest conversation")
             && !screen.contents().contains("Browsing history")
     });
-    terminal.send("\x03");
-    terminal.wait_screen("history draft cleared", |screen| {
-        !screen.contents().contains("draft survives history paging")
-    });
+    terminal.interrupt_once();
+    terminal.wait_composer(Some("draft survives history paging"), false);
     terminal.finish();
 }

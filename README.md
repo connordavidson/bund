@@ -68,14 +68,18 @@ the agent to read; it does not silently attach file contents.
 Routine activity is collapsed by default. **Ctrl+O** expands or collapses
 orange activity boxes beneath the corresponding responses, including tools
 and any reasoning summary supplied by the provider. A model may provide no
-reasoning summary. **PageUp/PageDown** scroll the conversation and pause
-following new output; **Ctrl+End** returns to the latest output. Expanding
-activity preserves your place in the conversation and your draft.
+reasoning summary. The mouse wheel and **PageUp/PageDown** scroll Bund's
+conversation and pause following new output; **Ctrl+End** returns to the latest
+output. Expanding activity preserves your place in the conversation and your
+draft.
 
 Typing while a run is active preserves a draft. A busy submission keeps that
-draft; queued steering is future work. Esc/Ctrl+C cancels active work and its
-command process group. At idle, Ctrl+C clears a draft, then exits on an empty
-draft. Ctrl+D on an empty composer or `/exit` also exits.
+draft; queued steering is future work. Esc cancels active work or denies a
+pending approval. To close the interactive interface, press **Ctrl+C twice
+consecutively within 1.5 seconds**. The first press cancels active work and its
+command process group while preserving your draft; the second exits. Other
+input or the timeout resets the exit confirmation. Ctrl+D and `/exit` display
+this shortcut without closing the interface.
 
 | Command | Behavior |
 | --- | --- |
@@ -88,12 +92,13 @@ draft. Ctrl+D on an empty composer or `/exit` also exits.
 | `/check` | Run configured validation commands through normal permissions |
 | `/skill PATH` | Invoke a workspace Markdown skill; directories use SKILL.md |
 | `/accept-edits on\|off` | Control direct-edit approvals for this session |
-| `/exit` | Cancel active work, restore the terminal, and exit |
+| `/exit` | Show the two-press Ctrl+C exit shortcut |
 
 Approval controls remain visible at the top. While an approval is pending,
-PageUp/PageDown scroll its preview in the middle of the screen; Ctrl+O still
-toggles activity. Exiting restores your previous terminal screen. Use
-`bund sessions` and `bund resume SESSION_ID` to revisit saved conversations.
+the mouse wheel and PageUp/PageDown scroll its preview in the middle of the
+screen; Ctrl+O still toggles activity. Exiting restores your previous terminal
+screen. Use `bund sessions` and `bund resume SESSION_ID` to revisit saved
+conversations.
 
 Project `AGENTS.md`
 guidance loads by directory scope; `CLAUDE.md` is the fallback at a directory

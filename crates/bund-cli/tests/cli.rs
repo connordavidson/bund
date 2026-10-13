@@ -490,8 +490,20 @@ fn fullscreen_pty_resumes_policy_and_restores_shell_after_tiny_resize() {
                 .skip(11)
                 .any(|line| line.contains("kept"))
         {
-            master.write_all(b"\x03/exit\r").unwrap();
+            master.write_all(b"\x03").unwrap();
             stage = 5;
+        }
+        if stage == 5 && contents.contains("Press Ctrl+C again to exit") {
+            assert!(screen.screen().alternate_screen());
+            let editor = screen
+                .screen()
+                .rows(0, 50)
+                .skip(11)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(editor.contains("draft") && editor.contains("kept"));
+            master.write_all(b"\x03").unwrap();
+            stage = 6;
         }
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "{}", String::from_utf8_lossy(&received));
@@ -501,6 +513,10 @@ fn fullscreen_pty_resumes_policy_and_restores_shell_after_tiny_resize() {
             let after = tcgetattr(&slave).unwrap();
             assert_eq!(before, after, "terminal modes must be restored");
             assert!(!screen.screen().alternate_screen());
+            assert_eq!(
+                screen.screen().mouse_protocol_mode(),
+                vt100::MouseProtocolMode::None
+            );
             assert!(screen.screen().contents().contains("SHELL_BEFORE_BUND"));
             restored = true;
             master.write_all(b"done\n").unwrap();
@@ -514,7 +530,7 @@ fn fullscreen_pty_resumes_policy_and_restores_shell_after_tiny_resize() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(stage == 5 && restored);
+    assert!(stage == 6 && restored);
     assert!(
         received.windows(8).any(|w| w == b"\x1b[?1049h"),
         "must enter alternate screen"
