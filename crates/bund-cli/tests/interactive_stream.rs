@@ -214,6 +214,7 @@ impl Pty {
                 "bund-pty-wrapper",
             ])
             .arg(env!("CARGO_BIN_EXE_bund"))
+            .arg("--no-keychain")
             .arg("--workspace")
             .arg(dir)
             .arg("--state-dir")

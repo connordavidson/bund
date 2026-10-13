@@ -12,6 +12,7 @@ fn command(dir: &std::path::Path) -> Command {
     std::fs::write(&config, "").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_bund"));
     command.args([
+        "--no-keychain",
         "--workspace",
         dir.to_str().unwrap(),
         "--state-dir",
@@ -213,6 +214,7 @@ fn configured_state_directory_recovers_from_unusable_default_location() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_bund"))
+        .arg("--no-keychain")
         .args(["--workspace", dir.path().to_str().unwrap()])
         .arg("--config")
         .arg(config)

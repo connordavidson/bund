@@ -6,7 +6,7 @@ use std::path::PathBuf;
     name = "bund",
     version,
     about = "A terminal coding agent with explicit permissions",
-    after_help = "Set OPENAI_API_KEY or ANTHROPIC_API_KEY, and choose a model with --model or BUND_MODEL.\nProject instructions are context; command permissions are enforced separately."
+    after_help = "Save a default model with: bund config set-model MODEL --provider openai|anthropic\nOn macOS, save an API key with: bund auth login --provider openai|anthropic\nOr set OPENAI_API_KEY or ANTHROPIC_API_KEY before launching Bund.\nProject instructions are context; command permissions are enforced separately."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -31,6 +31,9 @@ pub struct Options {
     pub state_dir: Option<PathBuf>,
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+    /// Use only environment credentials for agent requests; skip macOS Keychain.
+    #[arg(long, global = true)]
+    pub no_keychain: bool,
     /// Explore only; mutation tools and arbitrary commands are denied.
     #[arg(long, global = true)]
     pub plan: bool,
@@ -57,6 +60,16 @@ pub struct Options {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage API keys saved in macOS Keychain.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// View or save user settings without starting an agent or contacting a model.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Run once without a terminal UI; read piped input if present.
     Run {
         prompt: Option<String>,
@@ -70,6 +83,27 @@ pub enum Command {
     },
     /// Resume a saved session with the inline interface.
     Resume { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show the saved default provider, model and configuration path.
+    Show,
+    /// Save the model used by future sessions. Use --provider to switch providers.
+    SetModel {
+        #[arg(value_name = "MODEL")]
+        model_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Prompt for an API key without echoing it, then save it in macOS Keychain.
+    Login,
+    /// Show which credential source is available without displaying the key.
+    Status,
+    /// Remove the saved Keychain key; environment variables are unchanged.
+    Logout,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]

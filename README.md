@@ -42,8 +42,8 @@ inspection. `bund` can open without credentials; configure a model before
 submitting a prompt. Subscription access to another coding product is not an
 API credential for Bund.
 
-Once your model is saved in the user configuration below and its API key is
-exported in your terminal, start Bund in any project with:
+Once your model is saved and its API key is available through the environment
+or macOS Keychain, start Bund in any project with:
 
 ```sh
 cd /path/to/project
@@ -113,6 +113,40 @@ workspace root. It is not a prefix rule. Other commands still need approval.
 `--accept-edits` authorizes direct file edits, not host commands.
 
 ## Configuration
+
+Save your default model directly from the CLI:
+
+```sh
+bund config set-model gpt-5-nano --provider openai
+bund config show
+bund auth login --provider openai # macOS: hidden prompt, saved in Keychain
+bund
+```
+
+`config set-model` saves your user configuration for future sessions. Omit
+`--provider` to keep the saved provider (OpenAI if none is saved). It works
+without an API key or a session database and preserves unrelated settings and
+comments. `--config PATH` selects another configuration file. Re-selecting the
+same provider/model preserves its settings; changing models clears model-specific
+budgets, reasoning and capabilities, and changing providers also clears the old
+endpoint. An explicit `--endpoint` saves a new endpoint. `/model` in a running
+conversation changes only that session.
+
+On macOS, `bund auth login --provider openai` prompts for your key without
+echoing it and stores it as a generic password in macOS Keychain (service
+`com.connordavidson.bund`, account `openai` or `anthropic`). The key is never
+written to the TOML configuration. Use `bund auth status --provider openai` to
+show its source or `bund auth logout --provider openai` to remove the saved key.
+Omitting `--provider` uses the saved default provider. These commands work
+without opening a workspace or a session database.
+
+Nonempty `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` environment variables take
+precedence over saved keys. Otherwise Bund loads the selected provider's key
+from Keychain on its first request and keeps it in memory for that process.
+Restart Bund after changing a key already in use. `--no-keychain` restricts
+agent requests to environment credentials, which is useful for CI. Linux uses
+environment credentials; persistent Keychain login is macOS-only. No credentials
+are needed for configuration, saved-session listing, or opening the idle UI.
 
 User settings live in `~/.config/bund/config.toml` (or `$XDG_CONFIG_HOME`). Use
 `--config` for an explicit file. CLI flags override `BUND_PROVIDER`, `BUND_MODEL`

@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use bund_cli::{
-    args::{Cli, Command},
-    config, output, ui,
+    args::{AuthCommand, Cli, Command, ConfigCommand},
+    auth, config, output,
+    runtime_provider::RuntimeProvider,
+    ui,
 };
 use bund_core::{Engine, EngineDependencies, Mode, Provider};
-use bund_providers::{AnthropicProvider, OpenAiProvider};
 use bund_store::SqliteStore;
 use clap::Parser;
 use std::{
@@ -25,18 +26,78 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> Result<i32> {
+    if let Some(Command::Auth { command }) = &cli.command {
+        let provider = if let Some(provider) = &cli.options.provider {
+            provider.clone()
+        } else {
+            config::saved_model(&cli.options)?.provider
+        };
+        match command {
+            AuthCommand::Login => {
+                auth::login(&provider)?;
+                println!(
+                    "{}",
+                    output::clean(&format!(
+                        "Saved {provider} API key in macOS Keychain. Start Bund with: bund"
+                    ))
+                );
+                let variable = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "ANTHROPIC_API_KEY"
+                };
+                if std::env::var_os(variable).is_some_and(|value| !value.is_empty()) {
+                    println!("{variable} is set and takes precedence. Run `unset {variable}` to use the saved key.");
+                }
+            }
+            AuthCommand::Status => {
+                let source = auth::status(&provider)?;
+                println!("{}", output::clean(&format!("{provider}: {source}")));
+            }
+            AuthCommand::Logout => {
+                auth::logout(&provider)?;
+                println!("{}", output::clean(&format!("Removed saved {provider} key from macOS Keychain. Environment credentials are unchanged.")));
+            }
+        }
+        return Ok(0);
+    }
+    if let Some(Command::Config { command }) = &cli.command {
+        let saved = match command {
+            ConfigCommand::Show => config::saved_model(&cli.options)?,
+            ConfigCommand::SetModel { model_id } => {
+                config::set_default_model(&cli.options, model_id)?
+            }
+        };
+        let action = if matches!(command, ConfigCommand::SetModel { .. }) {
+            "Saved default"
+        } else {
+            "Saved default model"
+        };
+        let model = if saved.model.is_empty() {
+            "not configured"
+        } else {
+            &saved.model
+        };
+        println!(
+            "{}",
+            output::clean(&format!(
+                "{action}: {} / {model}\nConfiguration: {}",
+                saved.provider,
+                saved.path.display()
+            ))
+        );
+        if matches!(command, ConfigCommand::SetModel { .. }) {
+            println!("New sessions use this default. CLI flags and BUND_* environment settings override it.");
+        }
+        return Ok(0);
+    }
     let settings = config::load(&cli.options)?;
-    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        if !key.is_empty() {
-            providers.push(Arc::new(OpenAiProvider::new(key)));
-        }
-    }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            providers.push(Arc::new(AnthropicProvider::new(key)));
-        }
-    }
+    let providers: Vec<Arc<dyn Provider>> = ["openai", "anthropic"]
+        .into_iter()
+        .map(|provider| {
+            Arc::new(RuntimeProvider::new(provider, !cli.options.no_keychain)) as Arc<dyn Provider>
+        })
+        .collect();
     let store = Arc::new(
         SqliteStore::open(settings.state_dir.clone()).with_context(|| {
             format!(
@@ -51,6 +112,9 @@ async fn execute(cli: Cli) -> Result<i32> {
         store,
     })?;
     match cli.command {
+        Some(Command::Config { .. } | Command::Auth { .. }) => {
+            unreachable!("setup commands were handled before startup")
+        }
         Some(Command::Sessions { json }) => {
             let sessions = engine.list_sessions().await?;
             if json {
