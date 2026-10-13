@@ -144,7 +144,7 @@ impl Screen {
             let message_width = width - 2;
             let mut prompt = render::plain(&run.prompt, message_width, Style::default());
             prompt.push(Line::default());
-            document.message_section(&run.id, "prompt", prompt, Color::Blue);
+            document.message_section(&run.id, "prompt", prompt, render::QUERY_BLUE);
 
             let latest = run
                 .responses
@@ -1901,7 +1901,10 @@ mod tests {
         assert!(lines[2].trim().is_empty());
         assert_eq!(lines[3], "● Answer");
         assert_eq!(lines[4], "  next response line");
-        assert_eq!(document.rows[0].line.spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(
+            document.rows[0].line.spans[0].style.fg,
+            Some(render::QUERY_BLUE)
+        );
         assert_eq!(document.rows[3].line.spans[0].style.fg, Some(Color::Gray));
         assert!(lines[5].contains("Activity"));
         for width in [4, 12, 30] {

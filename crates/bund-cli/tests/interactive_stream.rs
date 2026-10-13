@@ -705,7 +705,7 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     );
     assert_eq!(
         screen.cell(query_row as u16, 0).unwrap().fgcolor(),
-        vt100::Color::Idx(4),
+        vt100::Color::Rgb(10, 132, 255),
         "the user dot is blue"
     );
     assert!(rows[query_row + 1].starts_with("  query continuation 世界"));

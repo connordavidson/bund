@@ -8,6 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub const ORANGE: Color = Color::Rgb(255, 184, 108);
+pub const QUERY_BLUE: Color = Color::Rgb(10, 132, 255);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anchor {
