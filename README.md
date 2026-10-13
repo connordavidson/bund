@@ -8,6 +8,9 @@ Use Anthropic Messages or OpenAI Responses with your own API credentials.
 The engine, tools, providers and store are independent of the terminal client.
 A future Rust desktop application can use the same session/approval/event API.
 
+Start with the [everyday flows guide](docs/quickstart.md) for saved model defaults,
+macOS Keychain login, reviewing work, resuming sessions, and startup fixes.
+
 ## Build and run
 
 Requirements: current stable Rust, macOS or Linux, and a model with tool calling
