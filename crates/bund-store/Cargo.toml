@@ -1,0 +1,21 @@
+[package]
+name = "bund-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bund-core.workspace = true
+async-trait.workspace = true
+nix.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+bund-tools.workspace = true
+bund-providers.workspace = true
+tokio-util.workspace = true
