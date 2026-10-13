@@ -179,7 +179,13 @@ are noninteractive; stdin is closed and background descendants are stopped.
 OS/container isolation is on the roadmap.
 
 Sessions are stored in an owner-only SQLite directory at
-`~/.local/state/bund` (or `$XDG_STATE_HOME`); override with `--state-dir`.
+`~/.local/state/bund` (or `$XDG_STATE_HOME/bund`). Override with `--state-dir`,
+or save a top-level `state_dir = "/absolute/path/to/bund-state"` before any
+`[section]` in your user configuration. Use an absolute path without `~` so
+sessions stay in the same place when you switch projects. The command-line
+option takes precedence. If the default folder is not writable, choose a
+folder your account owns, such as `/Users/yourname/Library/Application Support/bund`
+on macOS.
 Transcripts, instructions, code and command artifacts may contain sensitive
 project data. Credentials are not intentionally recorded. Model/tool context
 is sent to the explicitly selected API endpoint. There is no separate telemetry.

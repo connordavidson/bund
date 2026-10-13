@@ -37,7 +37,14 @@ async fn execute(cli: Cli) -> Result<i32> {
             providers.push(Arc::new(AnthropicProvider::new(key)));
         }
     }
-    let store = Arc::new(SqliteStore::open(settings.state_dir.clone())?);
+    let store = Arc::new(
+        SqliteStore::open(settings.state_dir.clone()).with_context(|| {
+            format!(
+                "cannot open Bund session storage at {}; choose a writable folder with --state-dir PATH or top-level state_dir in your user configuration",
+                settings.state_dir.display()
+            )
+        })?,
+    );
     let engine = Engine::new(EngineDependencies {
         providers,
         tools: bund_tools::built_in_tools(),

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    state_dir: Option<PathBuf>,
     #[serde(default)]
     model: ModelConfig,
     #[serde(default)]
@@ -152,10 +153,18 @@ pub fn load(args: &Options) -> Result<Settings> {
     let state_base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/state"));
-    let state_dir = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(|| state_base.join("bund"));
+    let state_dir = if let Some(path) = &args.state_dir {
+        path.clone()
+    } else if let Some(path) = config.state_dir {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "state_dir in {} must be an absolute path (without ~)",
+            config_path.display()
+        );
+        path
+    } else {
+        state_base.join("bund")
+    };
     Ok(Settings { options, state_dir })
 }
 
@@ -260,6 +269,39 @@ mod tests {
     #[test]
     fn no_model_is_not_silently_replaced() {
         assert!(require_model(&ModelProfile::new("openai", "")).is_err());
+    }
+    #[test]
+    fn configured_state_directory_is_stable_across_workspaces_and_cli_can_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let state = dir.path().join("Application Support/bund");
+        std::fs::write(
+            &path,
+            toml::to_string(&serde_json::json!({ "state_dir": state })).unwrap(),
+        )
+        .unwrap();
+        let mut args = Options {
+            workspace: Some(dir.path().into()),
+            config: Some(path.clone()),
+            ..Options::default()
+        };
+        assert_eq!(load(&args).unwrap().state_dir, state);
+        let other = dir.path().join("another-project");
+        std::fs::create_dir(&other).unwrap();
+        args.workspace = Some(other);
+        assert_eq!(load(&args).unwrap().state_dir, state);
+        args.state_dir = Some(dir.path().join("override"));
+        assert_eq!(
+            load(&args).unwrap().state_dir,
+            args.state_dir.clone().unwrap()
+        );
+        args.state_dir = None;
+        std::fs::write(path, "state_dir = '~/bund-state'\n").unwrap();
+        assert!(load(&args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("absolute path"));
     }
     #[test]
     fn cli_limits_override_config_and_zero_is_rejected() {

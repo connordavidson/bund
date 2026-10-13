@@ -26,18 +26,27 @@ fn storage(error: impl std::fmt::Display) -> Error {
     Error::Storage(error.to_string())
 }
 
+fn storage_at(action: &str, path: &Path, error: impl std::fmt::Display) -> Error {
+    storage(format!("cannot {action} '{}': {error}", path.display()))
+}
+
 fn private_dir(path: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
+        .create(path)
+        .map_err(|error| storage_at("create private directory", path, error))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| storage_at("inspect private directory", path, error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Error::Storage(
-            "state directory must be a real directory".into(),
+        return Err(storage_at(
+            "use private directory",
+            path,
+            "path must be a real directory, not a symlink",
         ));
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| storage_at("set private directory permissions", path, error))?;
     Ok(())
 }
 
@@ -53,33 +62,37 @@ impl SqliteStore {
             .write(true)
             .mode(0o600)
             .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&database)?;
-        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))?;
-        let connection = Connection::open(database).map_err(storage)?;
+            .open(&database)
+            .map_err(|error| storage_at("open session database", &database, error))?;
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| storage_at("set session database permissions", &database, error))?;
+        let connection = Connection::open(&database)
+            .map_err(|error| storage_at("open SQLite session database", &database, error))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(storage)?;
+            .map_err(|error| storage_at("configure session database timeout", &database, error))?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
             )
-            .map_err(storage)?;
+            .map_err(|error| storage_at("initialize session database", &database, error))?;
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(storage)?;
+            .map_err(|error| storage_at("read session database version", &database, error))?;
         if version > 2 {
             return Err(Error::Storage(format!(
-                "database version {version} is newer than this Bund build"
+                "session database '{}' has version {version}, which is newer than this Bund build",
+                database.display()
             )));
         }
         if version == 0 {
             connection.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE sessions (id TEXT PRIMARY KEY, state TEXT NOT NULL, cursor INTEGER NOT NULL, updated INTEGER NOT NULL DEFAULT (unixepoch()));
                 CREATE TABLE events (session_id TEXT NOT NULL REFERENCES sessions(id), sequence INTEGER NOT NULL, event TEXT NOT NULL, PRIMARY KEY(session_id, sequence));
-                PRAGMA user_version=1; COMMIT;").map_err(storage)?;
+                PRAGMA user_version=1; COMMIT;").map_err(|error| storage_at("create session database schema", &database, error))?;
         }
         if version < 2 {
-            connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE context_archive (session_id TEXT NOT NULL REFERENCES sessions(id), cursor INTEGER NOT NULL, state TEXT NOT NULL, PRIMARY KEY(session_id,cursor)); PRAGMA user_version=2; COMMIT;").map_err(storage)?;
+            connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE context_archive (session_id TEXT NOT NULL REFERENCES sessions(id), cursor INTEGER NOT NULL, state TEXT NOT NULL, PRIMARY KEY(session_id,cursor)); PRAGMA user_version=2; COMMIT;").map_err(|error| storage_at("migrate session database schema", &database, error))?;
         }
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -251,6 +264,68 @@ impl SessionStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn state_directory_failures_identify_the_operation_and_requested_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("not-a-directory");
+        std::fs::write(&blocked, "existing file").unwrap();
+        let root = blocked.join("bund");
+        let error = SqliteStore::open(&root)
+            .err()
+            .expect("state directory must fail");
+        assert!(matches!(error, Error::Storage(_)));
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot create private directory"),
+            "{message}"
+        );
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(
+            !message.contains("I/O:"),
+            "avoid an opaque duplicated I/O source: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "existing file");
+    }
+
+    #[test]
+    fn denied_parent_reports_the_state_directory_without_altering_parent_permissions() {
+        // Root bypasses Unix DAC; the deterministic path-error test above still
+        // runs in root containers. Only this local temporary directory is chmod'd.
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("protected");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let root = parent.join("bund");
+        let result = SqliteStore::open(&root);
+        let unchanged = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result
+            .err()
+            .expect("unwritable parent must fail")
+            .to_string();
+        assert!(error.contains("cannot create private directory"), "{error}");
+        assert!(error.contains(&root.display().to_string()), "{error}");
+        assert_eq!(error.matches("Permission denied").count(), 1, "{error}");
+        assert_eq!(unchanged, 0o500);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn database_open_failure_names_the_database_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sessions.sqlite3");
+        std::fs::create_dir(&database).unwrap();
+        let error = SqliteStore::open(temp.path())
+            .err()
+            .expect("database cannot be a directory")
+            .to_string();
+        assert!(error.contains("cannot open session database"), "{error}");
+        assert!(error.contains(&database.display().to_string()), "{error}");
+    }
+
     fn session(workspace: PathBuf) -> StoredSession {
         StoredSession {
             version: 1,

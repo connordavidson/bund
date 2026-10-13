@@ -201,6 +201,56 @@ fn headless_approval_exits_three_without_mutation() {
 }
 
 #[test]
+fn configured_state_directory_recovers_from_unusable_default_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("blocked-state-base");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let state = dir.path().join("Application Support/bund");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        toml::to_string(&json!({ "state_dir": state })).unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_bund"))
+        .args(["--workspace", dir.path().to_str().unwrap()])
+        .arg("--config")
+        .arg(config)
+        .args(["sessions", "--json"])
+        .env("XDG_STATE_HOME", blocked)
+        .env_remove("BUND_PROVIDER")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([])
+    );
+    assert!(state.join("sessions.sqlite3").is_file());
+}
+
+#[test]
+fn storage_startup_failure_names_path_and_explains_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::write(&state, "not a directory").unwrap();
+    let output = command(dir.path()).arg("sessions").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains(state.to_str().unwrap()), "{error}");
+    assert!(error.contains("--state-dir PATH"), "{error}");
+    assert!(
+        error.contains("state_dir in your user configuration"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(state).unwrap(), "not a directory");
+}
+
+#[test]
 fn missing_model_explains_setup_without_key_and_sessions_are_offline() {
     let dir = tempfile::tempdir().unwrap();
     let output = command(dir.path())
