@@ -52,6 +52,26 @@ pub struct ModelProfile {
     pub context_window: usize,
     pub max_output_tokens: u32,
     pub reasoning: Option<String>,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+}
+
+/// User-declared model support. An absent reasoning list means unknown; the
+/// provider still validates the request. An empty list disables reasoning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelCapabilities {
+    pub tool_calling: bool,
+    pub supported_reasoning: Option<Vec<String>>,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            tool_calling: true,
+            supported_reasoning: None,
+        }
+    }
 }
 
 impl ModelProfile {
@@ -63,6 +83,28 @@ impl ModelProfile {
             context_window: 128_000,
             max_output_tokens: 8192,
             reasoning: None,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+    pub fn validate_capabilities(&self, uses_tools: bool) -> Result<()> {
+        let message = if uses_tools && !self.capabilities.tool_calling {
+            Some("this model profile does not support tool calling")
+        } else if self.reasoning.as_ref().is_some_and(|effort| {
+            self.capabilities
+                .supported_reasoning
+                .as_ref()
+                .is_some_and(|values| !values.contains(effort))
+        }) {
+            Some("the selected reasoning setting is not supported by this model profile")
+        } else {
+            None
+        };
+        match message {
+            Some(message) => Err(Error::Provider {
+                kind: ProviderErrorKind::Unsupported,
+                message: message.into(),
+            }),
+            None => Ok(()),
         }
     }
     pub fn identity(&self) -> String {

@@ -78,6 +78,9 @@ fn continuation(profile: &ModelProfile, items: &[Value]) -> Result<Continuation>
 }
 
 fn validate_request(request: &ProviderRequest, id: &str) -> Result<()> {
+    request
+        .profile
+        .validate_capabilities(!request.tools.is_empty())?;
     if request.profile.provider != id {
         return Err(failure(
             ProviderErrorKind::Unsupported,

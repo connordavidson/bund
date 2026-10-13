@@ -533,3 +533,35 @@ async fn inspection_does_not_run_configured_mutating_checks() {
         .iter()
         .any(|e| matches!(e.kind, EventKind::ToolStarted { .. })));
 }
+
+#[tokio::test]
+async fn final_queued_stream_delta_is_persisted_before_completed_message() {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FakeProvider::new(vec![response(vec![])]));
+    let session = engine(Arc::new(SqliteStore::open(data.path()).unwrap()), provider)
+        .create_session(SessionOptions::new(
+            repo.path().into(),
+            ModelProfile::new("fake", "fixture"),
+        ))
+        .await
+        .unwrap();
+    let events = session.attach().await.unwrap().events;
+    session.submit("Explain".into()).await.unwrap();
+    let (status, live) = finish(&session, events, false).await;
+    assert_eq!(status, RunStatus::Completed);
+    let saved = session.events_after(0, 100).await.unwrap();
+    for events in [live, saved] {
+        let delta = events
+            .iter()
+            .position(|e| matches!(&e.kind, EventKind::TextDelta { text } if text == "Finished"))
+            .expect("last progress delta must not be lost on provider completion");
+        let message = events
+            .iter()
+            .position(
+                |e| matches!(&e.kind, EventKind::AssistantMessage { text } if text == "Finished"),
+            )
+            .unwrap();
+        assert!(delta < message);
+    }
+}

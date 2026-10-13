@@ -116,6 +116,10 @@ max_output_tokens = 8192
 # endpoint = "https://your-approved-gateway.example/v1"
 # reasoning = "medium" # optional; support depends on provider/model
 
+[model.capabilities]
+tool_calling = true
+# supported_reasoning = ["low", "medium", "high"] # declare actual model support
+
 [policy]
 accept_edits = false
 allowed_commands = []
@@ -131,6 +135,12 @@ Optional endpoints are API **base URLs including `/v1`**. Only configure a
 trusted endpoint: it receives the provider credential and task context. Bund
 does not automatically fail over to another provider. Explicit profile changes
 retain portable history and discard foreign opaque continuation state.
+
+Capabilities are explicit user declarations, not a bundled model catalog.
+Omitting `supported_reasoning` leaves support to provider validation; an empty
+list disables reasoning settings. Declared incompatibilities fail before an API
+request. Changing models resets model-specific limits, reasoning and capabilities
+to defaults; an endpoint is retained only within the same provider.
 
 Limit flags: `--max-rounds`, `--timeout`, `--command-timeout`, `--output-limit`.
 All must be positive; model-facing output is capped at 1 MiB. A private command

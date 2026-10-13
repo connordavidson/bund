@@ -1,6 +1,6 @@
 use crate::{
     config::{require_model, update_profile},
-    output::{clean, Sanitizer},
+    output::{clean, FinalText, Sanitizer, StreamedText},
 };
 use anyhow::{Context, Result};
 use bund_core::{
@@ -8,13 +8,9 @@ use bund_core::{
     SessionHandle, SessionSnapshot,
 };
 use crossterm::{
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers,
-    },
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
 };
-use futures_util::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
@@ -55,7 +51,7 @@ struct Screen {
     pending: Option<ApprovalRequest>,
     tail: String,
     sanitizer: Sanitizer,
-    streamed: bool,
+    streamed: StreamedText,
     output_calls: HashSet<String>,
     hint: String,
     history: History,
@@ -73,7 +69,7 @@ impl Screen {
             editor,
             tail: String::new(),
             sanitizer: Sanitizer::default(),
-            streamed: false,
+            streamed: StreamedText::default(),
             output_calls: HashSet::new(),
             hint: "Enter send · Alt+Enter newline · /help".into(),
             history,
@@ -238,14 +234,13 @@ async fn run_inner(
             screen.hint = error.to_string();
         }
     }
-    let mut input = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(33));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending_events = VecDeque::new();
     let mut dirty = true;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    loop {
+    'ui: loop {
         if let Some(event) = pending_events.pop_front() {
             process_event(&handle, &mut screen, &mut terminal, event, &mut cursor).await?;
             dirty = true;
@@ -253,22 +248,29 @@ async fn run_inner(
         }
         tokio::select! {
             _ = &mut shutdown => { handle.cancel().await?; break; },
-            _ = ticker.tick() => if dirty { terminal.draw(|frame| screen.render(frame))?; dirty = false; },
-            next = input.next() => {
-                let Some(next) = next else { handle.cancel().await?; break; };
-                match next? {
-                    Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                        match key_action(&handle, &mut screen, &mut terminal, key).await {
-                            Ok(true) => break,
-                            Ok(false) => {},
-                            Err(error) => screen.hint = error.to_string(),
-                        }
-                        dirty = true;
-                    },
-                    Event::Paste(text) if screen.pending.is_none() => { screen.editor.insert_str(clean(&text)); dirty = true; },
-                    Event::Resize(_, _) => dirty = true,
-                    _ => {},
+            _ = ticker.tick() => {
+                // Ratatui's inline insertion and resize may synchronously request
+                // the cursor position. A background EventStream would compete
+                // for Crossterm's input lock and can make those queries time out.
+                // This loop owns both input and rendering; zero-time polling
+                // never waits for input, and the bounded batch keeps work fair.
+                for _ in 0..32 {
+                    if !crossterm::event::poll(Duration::ZERO)? { break; }
+                    match crossterm::event::read()? {
+                        Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                            match key_action(&handle, &mut screen, &mut terminal, key).await {
+                                Ok(true) => break 'ui,
+                                Ok(false) => {},
+                                Err(error) => screen.hint = error.to_string(),
+                            }
+                            dirty = true;
+                        },
+                        Event::Paste(text) if screen.pending.is_none() => { screen.editor.insert_str(clean(&text)); dirty = true; },
+                        Event::Resize(_, _) => dirty = true,
+                        _ => {},
+                    }
                 }
+                if dirty { terminal.draw(|frame| screen.render(frame))?; dirty = false; }
             },
             received = events.recv() => match received {
                 Ok(event) => { process_event(&handle, &mut screen, &mut terminal, event, &mut cursor).await?; dirty = true; },
@@ -344,13 +346,15 @@ async fn apply_event(
     match event.kind {
         EventKind::RunStarted { prompt } => {
             flush_tail(screen, terminal)?;
+            screen.streamed = StreamedText::default();
+            screen.sanitizer = Sanitizer::default();
             screen.snapshot.status = RunStatus::Running;
             screen.hint = "Working · Esc cancels · draft stays editable".into();
             screen.output_calls.clear();
             insert(terminal, &format!("> {prompt}"))?;
         }
         EventKind::TextDelta { text } => {
-            screen.streamed = true;
+            screen.streamed.record(&text);
             screen.tail.push_str(&screen.sanitizer.push(&text));
             if let Some(end) = screen.tail.rfind('\n') {
                 let complete = screen.tail[..end].to_owned();
@@ -373,12 +377,16 @@ async fn apply_event(
             }
         }
         EventKind::AssistantMessage { text } => {
-            if screen.streamed {
-                flush_tail(screen, terminal)?;
-            } else if !text.is_empty() {
-                insert(terminal, &text)?;
+            match screen.streamed.finish(&text) {
+                FinalText::Append(suffix) => {
+                    screen.tail.push_str(&screen.sanitizer.push(suffix));
+                    flush_tail(screen, terminal)?;
+                }
+                FinalText::Replace(text) => {
+                    flush_tail(screen, terminal)?;
+                    insert(terminal, &format!("Final response:\n{text}"))?;
+                }
             }
-            screen.streamed = false;
             screen.sanitizer = Sanitizer::default();
         }
         EventKind::ApprovalRequired(request) => {
@@ -431,7 +439,8 @@ async fn apply_event(
         } => {
             flush_tail(screen, terminal)?;
             screen.pending = None;
-            screen.streamed = false;
+            screen.streamed = StreamedText::default();
+            screen.sanitizer = Sanitizer::default();
             screen.snapshot = handle.snapshot().await?;
             screen.hint = format!("{status:?} · checks {validation:?} · {}", clean(&message));
             if status != RunStatus::Completed {

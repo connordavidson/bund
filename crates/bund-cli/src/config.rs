@@ -1,6 +1,6 @@
 use crate::args::Options;
 use anyhow::{Context, Result};
-use bund_core::{Mode, ModelProfile, SessionOptions};
+use bund_core::{Mode, ModelCapabilities, ModelProfile, SessionOptions};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -25,6 +25,7 @@ struct ModelConfig {
     context_window: Option<usize>,
     max_output_tokens: Option<u32>,
     reasoning: Option<String>,
+    capabilities: Option<ModelCapabilities>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,23 +88,31 @@ pub fn load(args: &Options) -> Result<Settings> {
         .model
         .clone()
         .or_else(|| std::env::var("BUND_MODEL").ok())
-        .or_else(|| same_provider.then_some(config.model.model).flatten())
+        .or_else(|| {
+            same_provider
+                .then_some(config.model.model.clone())
+                .flatten()
+        })
         .unwrap_or_default();
+    let same_model = same_provider && config.model.model.as_deref().is_none_or(|id| id == model);
     let mut profile = ModelProfile::new(provider, model);
     profile.endpoint = args
         .endpoint
         .clone()
         .or_else(|| std::env::var("BUND_ENDPOINT").ok())
         .or_else(|| same_provider.then_some(config.model.endpoint).flatten());
-    if let Some(n) = config.model.context_window {
+    if let Some(n) = config.model.context_window.filter(|_| same_model) {
         anyhow::ensure!(n > 0, "context_window must be positive");
         profile.context_window = n;
     }
-    if let Some(n) = config.model.max_output_tokens {
+    if let Some(n) = config.model.max_output_tokens.filter(|_| same_model) {
         anyhow::ensure!(n > 0, "max_output_tokens must be positive");
         profile.max_output_tokens = n;
     }
-    profile.reasoning = same_provider.then_some(config.model.reasoning).flatten();
+    profile.reasoning = same_model.then_some(config.model.reasoning).flatten();
+    if let Some(capabilities) = config.model.capabilities.filter(|_| same_model) {
+        profile.capabilities = capabilities;
+    }
     let workspace = args
         .workspace
         .clone()
@@ -169,6 +178,11 @@ pub fn update_profile(
         ModelProfile::new(provider, model.unwrap_or(&current.model))
     };
     if let Some(model) = model {
+        if model != profile.model {
+            let mut replacement = ModelProfile::new(provider, model);
+            replacement.endpoint = profile.endpoint;
+            profile = replacement;
+        }
         profile.model = model.into();
     }
     if let Some(endpoint) = endpoint {
@@ -209,6 +223,39 @@ mod tests {
     #[test]
     fn config_rejects_typo_in_permission_field() {
         assert!(toml::from_str::<Config>("[policy]\nallow_commands=['rm -rf .']").is_err());
+    }
+    #[test]
+    fn model_change_resets_model_specific_settings_but_keeps_provider_endpoint() {
+        let mut current = ModelProfile::new("openai", "old");
+        current.endpoint = Some("https://gateway.example/v1".into());
+        current.context_window = 64_000;
+        current.reasoning = Some("high".into());
+        current.capabilities.supported_reasoning = Some(vec!["high".into()]);
+        let next = update_profile(&current, None, Some("new"), None);
+        assert_eq!(next.endpoint, current.endpoint);
+        assert_eq!(next.context_window, 128_000);
+        assert_eq!(next.reasoning, None);
+        assert_eq!(next.capabilities, ModelCapabilities::default());
+        assert_eq!(update_profile(&current, None, Some("old"), None), current);
+    }
+    #[test]
+    fn model_capabilities_are_configurable_and_validate_reasoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[model]\nprovider='openai'\nmodel='fixture'\nreasoning='high'\n[model.capabilities]\ntool_calling=true\nsupported_reasoning=['low']\n").unwrap();
+        let args = Options {
+            workspace: Some(dir.path().into()),
+            config: Some(path),
+            ..Options::default()
+        };
+        let profile = load(&args).unwrap().options.profile;
+        assert!(profile.validate_capabilities(true).is_err());
+        let mut compatible = profile;
+        compatible.reasoning = Some("low".into());
+        assert!(compatible.validate_capabilities(true).is_ok());
+        compatible.capabilities.tool_calling = false;
+        assert!(compatible.validate_capabilities(true).is_err());
+        assert!(compatible.validate_capabilities(false).is_ok());
     }
     #[test]
     fn no_model_is_not_silently_replaced() {

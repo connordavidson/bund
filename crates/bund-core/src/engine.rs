@@ -168,6 +168,7 @@ impl Engine {
 }
 
 fn validate_options(options: &SessionOptions) -> Result<()> {
+    options.profile.validate_capabilities(false)?;
     if !options.workspace.is_dir() {
         return Err(Error::Invalid("workspace is not a directory".into()));
     }
@@ -705,6 +706,9 @@ impl Session {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderResponse> {
+        request
+            .profile
+            .validate_capabilities(!request.tools.is_empty())?;
         let provider = self
             .providers
             .get(&request.profile.provider)
@@ -722,26 +726,44 @@ impl Session {
                 _ = tick.tick(), if !pending_text.is_empty() => { self.flush_text(&mut pending_text).await?; }
                 event = rx.recv(), if !rx.is_closed() || !rx.is_empty() => {
                     if let Some(event) = event {
-                        match event {
-                            ProviderEvent::TextDelta(text) => {
-                                pending_text.push_str(&text);
-                                if pending_text.len() >= 4096 { self.flush_text(&mut pending_text).await?; }
-                            }
-                            ProviderEvent::ReasoningSummary(text) => {
-                                self.flush_text(&mut pending_text).await?;
-                                let mut state = self.state.lock().await;
-                                self.emit(&mut state, EventKind::ReasoningSummary { text }).await?;
-                            }
-                            ProviderEvent::Retrying { .. } => {}
-                        }
+                        self.provider_progress(event, &mut pending_text).await?;
                     }
                 }
                 result = &mut work => {
+                    // Polling the provider can enqueue its last deltas and
+                    // complete in the same turn, after recv() was polled empty.
+                    // Drain those before publishing the completed response.
+                    while let Ok(event) = rx.try_recv() {
+                        self.provider_progress(event, &mut pending_text).await?;
+                    }
                     self.flush_text(&mut pending_text).await?;
                     return result;
                 }
             }
         }
+    }
+
+    async fn provider_progress(
+        &self,
+        event: ProviderEvent,
+        pending_text: &mut String,
+    ) -> Result<()> {
+        match event {
+            ProviderEvent::TextDelta(text) => {
+                pending_text.push_str(&text);
+                if pending_text.len() >= 4096 {
+                    self.flush_text(pending_text).await?;
+                }
+            }
+            ProviderEvent::ReasoningSummary(text) => {
+                self.flush_text(pending_text).await?;
+                let mut state = self.state.lock().await;
+                self.emit(&mut state, EventKind::ReasoningSummary { text })
+                    .await?;
+            }
+            ProviderEvent::Retrying { .. } => {}
+        }
+        Ok(())
     }
 
     async fn flush_text(&self, buffer: &mut String) -> Result<()> {

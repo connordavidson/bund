@@ -64,7 +64,7 @@ fn fixture(body: String) -> (String, thread::JoinHandle<()>) {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let thread = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut socket = loop {
             match listener.accept() {
                 Ok((socket, _)) => break socket,
@@ -75,13 +75,35 @@ fn fixture(body: String) -> (String, thread::JoinHandle<()>) {
                 Err(error) => panic!("{error}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let read_deadline = Instant::now() + Duration::from_secs(30);
         let mut request = Vec::new();
         loop {
             let mut buffer = [0; 4096];
-            let n = socket.read(&mut buffer).unwrap();
+            let n = match socket.read(&mut buffer) {
+                Ok(n) => n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    assert!(
+                        Instant::now() < read_deadline,
+                        "fixture request body timed out: {error}"
+                    );
+                    continue;
+                }
+                Err(error) => panic!("fixture read: {error}"),
+            };
             assert_ne!(n, 0);
             request.extend_from_slice(&buffer[..n]);
             if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -317,8 +339,9 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
         });
     }
     let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut received = Vec::new();
+    let mut cursor_scan = 0;
     let mut sent = false;
     let mut exiting = false;
     let mut restored = false;
@@ -327,12 +350,17 @@ fn inline_pty_preserves_primary_screen_and_restores_terminal_after_resize() {
         match master.read(&mut buffer) {
             Ok(n) => {
                 received.extend_from_slice(&buffer[..n]);
-                if buffer[..n].windows(4).any(|w| w == b"\x1b[6n") {
-                    master.write_all(b"\x1b[1;1R").unwrap();
-                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
+        }
+        while cursor_scan + 4 <= received.len() {
+            if &received[cursor_scan..cursor_scan + 4] == b"\x1b[6n" {
+                master.write_all(b"\x1b[1;1R").unwrap();
+                cursor_scan += 4;
+            } else {
+                cursor_scan += 1;
+            }
         }
         if !sent && String::from_utf8_lossy(&received).contains("/help for commands") {
             master.write_all(b"/help\r").unwrap();

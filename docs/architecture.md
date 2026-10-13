@@ -76,6 +76,9 @@ The portable transcript retains text, calls and results. Adapter-owned state
 preserves signed/encrypted continuation items under provider/endpoint/model
 identity. Switching profiles is explicit and drops foreign continuation bytes.
 There is no automatic provider failover. OpenAI requests use `store:false`.
+Model profiles declare context/output budgets and tool/reasoning capabilities.
+These are user-supplied declarations; unknown model support remains subject to
+API validation. Explicit incompatibilities fail before sending a request.
 
 Streaming progress is presentation-only. EOF, incomplete arguments and errors
 cannot authorize tools. Protocol fixtures exercise both adapters without API

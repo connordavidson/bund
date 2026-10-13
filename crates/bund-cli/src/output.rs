@@ -54,6 +54,49 @@ pub fn clean(text: &str) -> String {
     Sanitizer::default().push(text)
 }
 
+const STREAM_PREFIX_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+pub(crate) struct StreamedText {
+    prefix: String,
+    seen: bool,
+    overflow: bool,
+}
+
+pub(crate) enum FinalText<'a> {
+    Append(&'a str),
+    Replace(&'a str),
+}
+
+impl StreamedText {
+    pub fn record(&mut self, text: &str) {
+        self.seen = true;
+        if !self.overflow && text.len() <= STREAM_PREFIX_LIMIT.saturating_sub(self.prefix.len()) {
+            self.prefix.push_str(text);
+        } else {
+            self.overflow = true;
+            self.prefix.clear();
+        }
+    }
+
+    pub fn seen(&self) -> bool {
+        self.seen
+    }
+
+    /// Streaming progress can omit deltas under backpressure. The completed
+    /// response is authoritative. A bounded prefix lets us append just a missing
+    /// suffix; gaps or very large streams require a clearly labelled full copy.
+    pub fn finish<'a>(&mut self, text: &'a str) -> FinalText<'a> {
+        let streamed = std::mem::take(self);
+        if !streamed.overflow {
+            if let Some(suffix) = text.strip_prefix(&streamed.prefix) {
+                return FinalText::Append(suffix);
+            }
+        }
+        FinalText::Replace(text)
+    }
+}
+
 pub fn exit_code(status: RunStatus) -> i32 {
     match status {
         RunStatus::Completed => 0,
@@ -70,7 +113,7 @@ pub async fn headless(handle: SessionHandle, prompt: String, format: OutputForma
     let mut pending: VecDeque<SessionEvent> = VecDeque::new();
     let mut forced_code = None;
     let mut sanitizer = Sanitizer::default();
-    let mut streamed = false;
+    let mut streamed = StreamedText::default();
     loop {
         let event = if let Some(event) = pending.pop_front() {
             event
@@ -125,15 +168,15 @@ pub async fn headless(handle: SessionHandle, prompt: String, format: OutputForma
             EventKind::TextDelta { text } if format == OutputFormat::Text => {
                 print!("{}", sanitizer.push(&text));
                 io::stdout().flush()?;
-                streamed = true;
+                streamed.record(&text);
             }
             EventKind::AssistantMessage { text } if format == OutputFormat::Text => {
-                if !streamed {
-                    print!("{}", clean(&text));
+                match streamed.finish(&text) {
+                    FinalText::Append(suffix) => print!("{}", sanitizer.push(suffix)),
+                    FinalText::Replace(text) => print!("\nFinal response:\n{}", clean(text)),
                 }
                 println!();
                 io::stdout().flush()?;
-                streamed = false;
                 sanitizer = Sanitizer::default();
             }
             EventKind::ApprovalRequired(request) => {
@@ -156,7 +199,7 @@ pub async fn headless(handle: SessionHandle, prompt: String, format: OutputForma
                 if format == OutputFormat::Text
                     && (status != RunStatus::Completed || !message.is_empty())
                 {
-                    if streamed {
+                    if streamed.seen() {
                         println!();
                     }
                     if status != RunStatus::Completed {
@@ -173,6 +216,33 @@ pub async fn headless(handle: SessionHandle, prompt: String, format: OutputForma
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_response_recovers_missing_deltas_without_duplicating_complete_streams() {
+        let mut stream = StreamedText::default();
+        stream.record("世界 ");
+        assert!(matches!(
+            stream.finish("世界 complete"),
+            FinalText::Append("complete")
+        ));
+        stream.record("complete");
+        assert!(matches!(stream.finish("complete"), FinalText::Append("")));
+        stream.record("first ");
+        stream.record("last");
+        assert!(matches!(
+            stream.finish("first missing last"),
+            FinalText::Replace("first missing last")
+        ));
+        stream.record(&"x".repeat(STREAM_PREFIX_LIMIT + 1));
+        assert!(stream.prefix.len() <= STREAM_PREFIX_LIMIT);
+        assert!(matches!(
+            stream.finish("complete"),
+            FinalText::Replace("complete")
+        ));
+        assert!(matches!(
+            stream.finish("next message"),
+            FinalText::Append("next message")
+        ));
+    }
     #[test]
     fn strips_split_osc_and_csi_without_corrupting_unicode() {
         let mut s = Sanitizer::default();
