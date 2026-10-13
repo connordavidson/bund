@@ -86,6 +86,9 @@ approvals. Ctrl+Y approves the displayed action once; Ctrl+N or Esc denies it.
 The first Ctrl+C cancels active work and keeps your draft. Completed edits
 remain after cancellation.
 
+Blue dots mark your queries and gray dots mark Bund's responses. A blank line
+separates them, and continuation lines align with the message text.
+
 Ctrl+O expands orange activity boxes beneath responses, including tools and
 provider-supplied reasoning summaries; press it again to collapse them.
 The mouse wheel and PageUp/PageDown scroll Bund's conversation without following

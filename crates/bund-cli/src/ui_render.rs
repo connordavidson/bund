@@ -28,6 +28,34 @@ pub struct Document {
 }
 
 impl Document {
+    /// Add a two-column speaker gutter after computing anchors from the body.
+    /// Callers wrap the body at the available width minus these two columns.
+    pub fn message_section(
+        &mut self,
+        run: &str,
+        section: &str,
+        lines: Vec<Line<'static>>,
+        color: Color,
+    ) {
+        let start = self.rows.len();
+        self.section(run, section, lines);
+        let mut marked = false;
+        for row in &mut self.rows[start..] {
+            let has_text = row
+                .line
+                .spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty());
+            let prefix = if !marked && has_text {
+                marked = true;
+                Span::styled("● ", Style::default().fg(color))
+            } else {
+                Span::raw("  ")
+            };
+            row.line.spans.insert(0, prefix);
+        }
+    }
+
     pub fn section(&mut self, run: &str, section: &str, lines: Vec<Line<'static>>) {
         let mut offset = 0;
         self.rows.extend(lines.into_iter().map(|line| {
@@ -231,6 +259,70 @@ pub fn bordered(title: &str, body: Vec<Line<'static>>, width: usize) -> Vec<Line
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_gutters_preserve_markdown_and_unicode_at_narrow_widths() {
+        for width in [4, 8, 20] {
+            let mut document = Document::default();
+            document.message_section(
+                "run",
+                "answer",
+                markdown("\n**bold** `世界e\u{301}`\nnext line", width - 2),
+                Color::Gray,
+            );
+            let rows = &document.rows;
+            assert_eq!(rows[0].line.to_string().trim(), "");
+            assert_eq!(rows[1].line.spans[0].content, "● ");
+            assert_eq!(rows[1].line.spans[0].style.fg, Some(Color::Gray));
+            for (i, row) in rows.iter().enumerate() {
+                assert!(row.line.width() <= width);
+                if i != 1 {
+                    assert_eq!(row.line.spans[0].content, "  ");
+                }
+            }
+            let spans = rows
+                .iter()
+                .flat_map(|row| row.line.spans.iter().skip(1))
+                .collect::<Vec<_>>();
+            let text = spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(text.contains("世界e\u{301}"));
+            assert!(spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+            assert!(spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::LightCyan)));
+        }
+    }
+
+    #[test]
+    fn message_gutters_do_not_change_source_anchors_on_resize() {
+        let text = "abcdefghij".repeat(200);
+        let mut wide = Document::default();
+        wide.message_section(
+            "run",
+            "prompt",
+            plain(&text, 80, Style::default()),
+            Color::Blue,
+        );
+        assert_eq!(wide.rows[0].line.spans[0].style.fg, Some(Color::Blue));
+        let anchor = wide.rows[10].anchor.clone();
+        assert_eq!(anchor.offset, 800);
+        let mut narrow = Document::default();
+        narrow.message_section(
+            "run",
+            "prompt",
+            plain(&text, 40, Style::default()),
+            Color::Blue,
+        );
+        assert_eq!(narrow.rows[narrow.position(&anchor)].anchor, anchor);
+        assert_eq!(narrow.rows[0].line.width(), 42);
+        assert_eq!(wide.rows[0].line.width(), 82);
+    }
+
     #[test]
     fn unicode_and_styles_fit_narrow_rows() {
         for width in [1, 4, 20] {

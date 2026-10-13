@@ -22,6 +22,8 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(30);
 const DRAFT: &str = "Continue 世界 e\u{301} 🦀\nkeep this draft";
+const PROMPT: &str = "begin fixture\nquery continuation 世界";
+const STREAMING: &str = "Streaming ready 界\nAssistant continuation 🦀\n";
 const REASONING: &str = "REASONING_ONLY_WHEN_EXPANDED\nInspect the workspace before editing.";
 const LATEST: &str = "NEW_OUTPUT_WHILE_BROWSING";
 const ORANGE: vt100::Color = vt100::Color::Rgb(255, 184, 108);
@@ -140,7 +142,7 @@ fn fixture() -> Fixture {
     let worker = thread::spawn(move || {
         let (mut socket, request) = accept_request(&listener);
         requests_tx.send(request).unwrap();
-        let text = format!("Streaming ready 界\n{}", HOSTILE.concat());
+        let text = format!("{STREAMING}{}", HOSTILE.concat());
         let item = message("m1", &text);
         let reasoning = json!({"type":"reasoning","id":"rs1",
             "summary":[{"type":"summary_text","text":REASONING}],
@@ -151,7 +153,7 @@ fn fixture() -> Fixture {
                 json!({"type":"response.reasoning_summary_text.delta","output_index":1,
                 "item_id":"rs1","summary_index":0,"delta":REASONING}),
             )
-            + &delta("Streaming ready 界\n");
+            + &delta(STREAMING);
         let proposed = (0..40)
             .map(|i| format!("Proposed line {i:02}: must not be written\n"))
             .collect::<String>();
@@ -683,8 +685,52 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         .join("\n");
     assert!(header.contains("fixture-model"), "{header}");
     assert!(header.contains("Ctrl+O"), "{header}");
-    terminal.send("begin fixture\r");
+    terminal.send(&format!("\x1b[200~{PROMPT}\x1b[201~\r"));
     terminal.wait_visible("Streaming ready");
+    terminal.wait_visible("Assistant continuation 🦀");
+    let screen = terminal.screen.screen();
+    let rows: Vec<_> = screen.rows(0, 90).collect();
+    let query_row = rows
+        .iter()
+        .position(|line| line.contains("begin fixture"))
+        .unwrap();
+    let response_row = rows
+        .iter()
+        .position(|line| line.contains("Streaming ready"))
+        .unwrap();
+    assert!(
+        rows[query_row].starts_with("● begin fixture"),
+        "{}",
+        rows[query_row]
+    );
+    assert_eq!(
+        screen.cell(query_row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Idx(4),
+        "the user dot is blue"
+    );
+    assert!(rows[query_row + 1].starts_with("  query continuation 世界"));
+    assert!(
+        rows[query_row + 2].trim().is_empty(),
+        "a blank line separates the query and answer"
+    );
+    assert_eq!(response_row, query_row + 3);
+    assert!(
+        rows[response_row].starts_with("● Streaming ready 界"),
+        "{}",
+        rows[response_row]
+    );
+    assert_eq!(
+        screen.cell(response_row as u16, 0).unwrap().fgcolor(),
+        vt100::Color::Idx(7),
+        "the assistant dot is gray"
+    );
+    assert!(rows[response_row + 1].starts_with("  Assistant continuation 🦀"));
+    assert!(
+        !rows[4..19]
+            .iter()
+            .any(|line| matches!(line.trim(), "You" | "Bund")),
+        "speaker dots replace standalone speaker-label rows"
+    );
     fixture.requests.recv_timeout(WAIT).unwrap();
     terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
     terminal.wait_composer(Some(DRAFT), false);
@@ -856,7 +902,7 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
             .collect();
         assert_eq!(
             prompts,
-            ["begin fixture", DRAFT],
+            [PROMPT, DRAFT],
             "busy Enter must not enqueue or damage the draft"
         );
         sessions[0].id.clone()
@@ -977,6 +1023,8 @@ fn saved_conversation_pages_across_windows_without_skipping_turns() {
             .lines()
             .filter_map(|line| {
                 line.trim()
+                    .strip_prefix("● ")
+                    .unwrap_or(line.trim())
                     .strip_prefix("Saved answer ")
                     .and_then(|index| index.parse().ok())
             })
@@ -1051,5 +1099,103 @@ fn saved_conversation_pages_across_windows_without_skipping_turns() {
     });
     terminal.interrupt_once();
     terminal.wait_composer(Some("draft survives history paging"), false);
+    terminal.finish();
+}
+
+#[test]
+fn idle_width_changes_repaint_both_right_borders_after_rapid_resize_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let text = format!(
+            "{}ANSWER_END",
+            "Readable 世界 e\u{301} 🦀 response. ".repeat(4)
+        );
+        let item = message("resize-message", &text);
+        let reasoning = json!({"type":"reasoning","id":"resize-reasoning",
+            "summary":[{"type":"summary_text","text":format!("{}REASONING_END", "Inspect Unicode 世界 safely. ".repeat(3))}]});
+        let response = start("resize-response", &item)
+            + &delta(&text)
+            + &finish("resize-response", &[item, reasoning]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("show resize fixture\r");
+    terminal.wait_visible("Completed");
+    terminal.send("\x0f");
+    terminal.wait_visible("REASONING_END");
+    worker.join().unwrap();
+    let draft = format!(
+        "{}FIRST_END\n{}LAST_END",
+        "Draft 世界 ".repeat(7),
+        "Second e\u{301} 🦀 ".repeat(6)
+    );
+    terminal.send(&format!("\x1b[200~{draft}\x1b[201~"));
+
+    fn right_borders(screen: &vt100::Screen) -> bool {
+        let (rows, cols) = screen.size();
+        let composer = rows - 5;
+        if screen.cell(composer, cols - 1).unwrap().contents() != "╮"
+            || screen.cell(rows - 1, cols - 1).unwrap().contents() != "╯"
+            || !(composer + 1..rows - 1)
+                .all(|row| screen.cell(row, cols - 1).unwrap().contents() == "│")
+        {
+            return false;
+        }
+        let mut activity_rows = 0;
+        for row in 4..composer {
+            let left = screen.cell(row, 0).unwrap();
+            if left.fgcolor() != ORANGE {
+                continue;
+            }
+            let expected = match left.contents() {
+                "╭" => "╮",
+                "╰" => "╯",
+                "│" => "│",
+                _ => continue,
+            };
+            let right = screen.cell(row, cols - 1).unwrap();
+            if right.contents() != expected || right.fgcolor() != ORANGE {
+                return false;
+            }
+            activity_rows += 1;
+        }
+        activity_rows >= 3
+    }
+
+    terminal.resize(24, 120);
+    terminal.wait_screen("wide interface right edges", right_borders);
+    terminal.wait_composer(Some(&draft), false);
+    for cols in [43, 101, 57, 120] {
+        terminal.resize(24, cols);
+        terminal.wait_screen("idle width-only resize updates right edges", right_borders);
+        terminal.wait_visible("LAST_END");
+        terminal.assert_occupied();
+    }
+    terminal.wait_composer(Some(&draft), false);
+
+    // A drag can shrink and return to the same final width before the next UI
+    // frame. The terminal has still discarded the old right-hand cells, even
+    // when the renderer's cached dimensions match the final physical winsize.
+    for cols in [47, 32, 65, 38] {
+        let before = terminal.screen.screen().contents();
+        terminal.resize(24, cols);
+        terminal.resize(24, 120);
+        terminal.wait_screen(
+            "same-width resize round trip repaints lost cells",
+            right_borders,
+        );
+        terminal.wait_composer(Some(&draft), false);
+        assert_eq!(
+            terminal.screen.screen().contents(),
+            before,
+            "an idle resize round trip must restore all header, transcript, and draft cells"
+        );
+    }
     terminal.finish();
 }

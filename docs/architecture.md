@@ -113,6 +113,11 @@ active work while retaining the draft; other input or expiry resets the
 confirmation. Ctrl+D and `/exit` display the exit shortcut. This does not change
 headless cancellation.
 
+Resize handling samples the terminal dimensions while idle and invalidates the
+screen on every resize notification, including rapid shrink/grow cycles that end
+at the previous size. One repaint after resizing settles repairs any frame drawn
+during the drag without continually repainting an idle terminal.
+
 The conversation is retained application state, not text appended to native
 scrollback. Ordered session events reconstruct response text, tool activity,
 and provider-supplied reasoning summaries on resume. Completed responses

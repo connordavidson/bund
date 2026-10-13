@@ -141,15 +141,10 @@ impl Screen {
             document.section("welcome", "welcome", render::markdown("Ask Bund to inspect or change this workspace.\n/help lists commands. Edits and shell commands require approval.", width));
         }
         for run in self.transcript.runs() {
-            let mut prompt = vec![Line::styled(
-                "You",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )];
-            prompt.extend(render::plain(&run.prompt, width, Style::default()));
+            let message_width = width - 2;
+            let mut prompt = render::plain(&run.prompt, message_width, Style::default());
             prompt.push(Line::default());
-            document.section(&run.id, "prompt", prompt);
+            document.message_section(&run.id, "prompt", prompt, Color::Blue);
 
             let latest = run
                 .responses
@@ -167,25 +162,24 @@ impl Screen {
                         .map(|r| r.text.as_str())
                 })
                 .unwrap_or("");
-            let mut answer = vec![Line::styled(
-                "Bund",
-                Style::default().add_modifier(Modifier::BOLD),
-            )];
+            let mut answer = Vec::new();
             if !text.is_empty() {
-                answer.extend(render::markdown(text, width));
+                answer.extend(render::markdown(text, message_width));
             } else if run.status.is_active() {
-                answer.push(Line::styled(
+                answer.extend(render::plain(
                     "Working…",
+                    message_width,
                     Style::default().fg(Color::DarkGray),
                 ));
             }
             if latest.is_some_and(|r| !r.complete) && !run.status.is_active() {
-                answer.push(Line::styled(
+                answer.extend(render::plain(
                     "Incomplete response",
+                    message_width,
                     Style::default().fg(Color::Yellow),
                 ));
             }
-            document.section(&run.id, "answer", answer);
+            document.message_section(&run.id, "answer", answer, Color::Gray);
 
             let activity = format!("Activity · {} tools", run.tools.len());
             if self.expanded {
@@ -765,6 +759,8 @@ async fn run_inner(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending_events = VecDeque::new();
     let mut dirty = true;
+    let mut rendered_size = terminal.size()?;
+    let mut resize_settles_at = None;
     let shutdown = termination_signal();
     tokio::pin!(shutdown);
     let mut interrupt = InterruptListener::new()?;
@@ -778,6 +774,7 @@ async fn run_inner(
             },
             _ = ticker.tick() => {
                 dirty |= screen.expire_exit_confirmation();
+                let mut resize_reported = false;
                 // One owner handles terminal input and drawing. Bound each batch
                 // so paste/output bursts cannot starve cancellation or approvals.
                 for _ in 0..32 {
@@ -806,7 +803,7 @@ async fn run_inner(
                             }
                             dirty = true;
                         },
-                        Event::Resize(_, _) => dirty = true,
+                        Event::Resize(_, _) => resize_reported = true,
                         _ => {},
                     }
                 }
@@ -824,7 +821,30 @@ async fn run_inner(
                         dirty = true;
                     },
                 }
-                if dirty { terminal.draw(|frame| screen.render(frame))?; dirty = false; }
+                // Resize notifications can coalesce while a window is dragged.
+                // Query the current size even while idle, and invalidate the
+                // physical screen after any resize, including a shrink/grow
+                // round trip back to the last rendered dimensions.
+                let size = terminal.size()?;
+                let now = Instant::now();
+                let resized = resize_reported || size != rendered_size;
+                if resized {
+                    resize_settles_at = Some(now + Duration::from_millis(150));
+                }
+                let settled = resize_settles_at.is_some_and(|deadline| now >= deadline);
+                if resized || settled {
+                    // A final repaint also repairs a resize that occurred while
+                    // the preceding frame was being written to the terminal.
+                    // resize() clears Ratatui's previous buffer even at the same
+                    // size, without a blocking cursor-position query.
+                    terminal.resize(size.into())?;
+                    dirty = true;
+                    if settled { resize_settles_at = None; }
+                }
+                if dirty {
+                    rendered_size = terminal.draw(|frame| screen.render(frame))?.area.as_size();
+                    dirty = false;
+                }
             },
             received = events.recv(), if pending_events.is_empty() => match received {
                 Ok(event) => { process_event(&handle, &mut screen, event, &mut cursor, &mut pending_events).await?; dirty = true; },
@@ -1852,6 +1872,45 @@ mod tests {
             kind,
         });
         screen.document_dirty = true;
+    }
+
+    #[test]
+    fn messages_have_speaker_dots_indented_bodies_and_blank_separation() {
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "Query\nnext query line".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::RunOutput {
+                response_id: None,
+                text: "**Answer**\nnext response line".into(),
+            },
+        );
+        let document = screen.build_document(80);
+        let lines = document
+            .rows
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(lines[0], "● Query");
+        assert_eq!(lines[1], "  next query line");
+        assert!(lines[2].trim().is_empty());
+        assert_eq!(lines[3], "● Answer");
+        assert_eq!(lines[4], "  next response line");
+        assert_eq!(document.rows[0].line.spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(document.rows[3].line.spans[0].style.fg, Some(Color::Gray));
+        assert!(lines[5].contains("Activity"));
+        for width in [4, 12, 30] {
+            assert!(screen
+                .build_document(width)
+                .rows
+                .iter()
+                .all(|row| row.line.width() <= width));
+        }
     }
 
     #[test]
