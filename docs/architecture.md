@@ -105,9 +105,13 @@ One Crossterm event source and one fullscreen Ratatui renderer own the terminal.
 The interactive client enters the alternate screen, captures mouse input for
 its own history navigation, and restores the original screen, mouse handling,
 and terminal modes on exit. Workspace, model, status, and keyboard hints
-stay at the top; the query box stays at the bottom. Approval controls occupy a
-pinned strip, with a scrollable review preview in the middle. The composer
-survives streaming, expansion, resize, and approval requests. Interactive exit
+stay at the top; the query box stays at the bottom. During approval, numbered
+choices replace the composer contents: 1 approves once, 2 denies, and the last
+option, 3 Tell Bund what to do, opens a separate guidance editor. The original
+draft, cursor, and selection remain intact. Enter sends guidance as a denied
+tool result for the next model request; Esc returns to the choices. A scrollable
+review preview remains between the header and query box. The composer survives
+streaming, expansion, resize, and approval requests. Interactive exit
 requires two consecutive Ctrl+C presses within 1.5 seconds. The first cancels
 active work while retaining the draft; other input or expiry resets the
 confirmation. Ctrl+D and `/exit` display the exit shortcut. This does not change

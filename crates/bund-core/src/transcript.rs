@@ -263,7 +263,10 @@ impl Transcript {
                     .iter_mut()
                     .find(|tool| tool.approval_id.as_ref() == Some(id))
                 {
-                    tool.status = if *decision == ApprovalDecision::Deny {
+                    tool.status = if matches!(
+                        decision,
+                        ApprovalDecision::Deny | ApprovalDecision::DenyWithFeedback { .. }
+                    ) {
                         TranscriptToolStatus::Denied
                     } else {
                         TranscriptToolStatus::Proposed

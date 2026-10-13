@@ -373,11 +373,15 @@ pub struct ApprovalRequest {
     pub workspace: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Maximum UTF-8 byte length of user guidance attached to a denied approval.
+pub const MAX_APPROVAL_FEEDBACK_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     ApproveOnce,
     Deny,
+    DenyWithFeedback { feedback: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

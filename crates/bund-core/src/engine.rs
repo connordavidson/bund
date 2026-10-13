@@ -257,6 +257,16 @@ impl SessionHandle {
         Ok(())
     }
     pub async fn answer_approval(&self, id: &str, decision: ApprovalDecision) -> Result<()> {
+        if let ApprovalDecision::DenyWithFeedback { feedback } = &decision {
+            if feedback.trim().is_empty() {
+                return Err(Error::Invalid("approval feedback must not be blank".into()));
+            }
+            if feedback.len() > MAX_APPROVAL_FEEDBACK_BYTES {
+                return Err(Error::Invalid(format!(
+                    "approval feedback exceeds {MAX_APPROVAL_FEEDBACK_BYTES} bytes"
+                )));
+            }
+        }
         let mut pending = self.inner.approval.lock().await;
         if pending
             .as_ref()
@@ -948,13 +958,22 @@ impl Session {
                     &mut state,
                     EventKind::ApprovalResolved {
                         id: request.id,
-                        decision,
+                        decision: decision.clone(),
                     },
                 )
                 .await?;
             }
-            if decision == ApprovalDecision::Deny {
-                return Err(Error::Denied(format!("user denied {}", call.name)));
+            match decision {
+                ApprovalDecision::ApproveOnce => {}
+                ApprovalDecision::Deny => {
+                    return Err(Error::Denied(format!("user denied {}", call.name)));
+                }
+                ApprovalDecision::DenyWithFeedback { feedback } => {
+                    return Err(Error::Denied(format!(
+                        "user denied {}.\nUser guidance for your next action:\n{feedback}",
+                        call.name
+                    )));
+                }
             }
         }
         if cancel.is_cancelled() {

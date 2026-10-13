@@ -10,7 +10,7 @@ use bund_core::{
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -29,9 +29,14 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+#[path = "ui_clipboard.rs"]
+mod clipboard;
 #[path = "ui_render.rs"]
 mod render;
+#[path = "ui_selection.rs"]
+mod selection;
 use render::{Anchor, Document};
+use selection::{SelectionRow, SelectionView};
 
 const COMMANDS: &[&str] = &[
     "/help",
@@ -48,11 +53,12 @@ const COMMANDS: &[&str] = &[
 const EXIT_WINDOW: Duration = Duration::from_millis(1500);
 const EXIT_CONFIRM: &str = "Press Ctrl+C again to exit";
 const EXIT_INSTRUCTION: &str = "To exit, press Ctrl+C twice within 1.5 seconds";
-const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: Ctrl+Y approves once; Ctrl+N or Esc denies.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
+const HELP: &str = "Commands: /plan /act /model [provider] MODEL /diff /undo /compact /check /skill PATH /accept-edits on|off\nEnter submits; Alt+Enter or Ctrl+J inserts a newline; Tab completes commands and @paths.\nEsc cancels work. Exit with Ctrl+C twice within 1.5 seconds; the first press cancels work and preserves your draft.\nApproval: 1 approves once; 2 denies; 3 Tell Bund what to do opens guidance. Enter sends guidance; Esc returns to choices. Ctrl+Y/Ctrl+N still approve/deny.\nCtrl+O expands activity; Mouse wheel or PgUp/PgDn scroll; Ctrl+End returns to latest output.\nDrag response text to highlight; release to copy. Displayed line breaks are preserved.\nType while work runs; busy submission keeps your draft. Up/Down recall history on a single line.\n@file references tell the agent which workspace files to inspect.\nPermissions are application checks, not an operating-system sandbox. Shell actions cannot be undone.";
 
 /// One state owner keeps drafts independent from streaming and approval controls.
 struct Screen {
     editor: TextArea<'static>,
+    approval_feedback: Option<TextArea<'static>>,
     snapshot: SessionSnapshot,
     pending: Option<ApprovalRequest>,
     transcript: Transcript,
@@ -62,6 +68,8 @@ struct Screen {
     document: Document,
     document_dirty: bool,
     document_width: u16,
+    selection: SelectionView,
+    clipboard_task: Option<tokio::task::JoinHandle<Result<()>>>,
     viewport_height: usize,
     top: usize,
     approval_scroll: usize,
@@ -90,6 +98,9 @@ struct HistoryLoad {
 impl Drop for Screen {
     fn drop(&mut self) {
         if let Some(task) = self.history_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.clipboard_task.take() {
             task.abort();
         }
     }
@@ -371,6 +382,7 @@ impl Screen {
             pending: snapshot.pending_approval.clone(),
             snapshot,
             editor,
+            approval_feedback: None,
             transcript: history_window(),
             expanded: false,
             follow: true,
@@ -378,6 +390,8 @@ impl Screen {
             document: Document::default(),
             document_dirty: true,
             document_width: 0,
+            selection: SelectionView::new(Rect::default(), Vec::new()),
+            clipboard_task: None,
             viewport_height: 0,
             top: 0,
             approval_scroll: 0,
@@ -392,6 +406,21 @@ impl Screen {
     }
     fn draft(&self) -> String {
         self.editor.lines().join("\n")
+    }
+    fn paste(&mut self, text: &str) {
+        if let Some(editor) = &mut self.approval_feedback {
+            editor.insert_str(clean(text));
+        } else if self.pending.is_none() {
+            self.editor.insert_str(clean(text));
+        }
+    }
+    fn start_approval_feedback(&mut self) {
+        let mut editor = TextArea::default();
+        editor.set_cursor_line_style(Style::default());
+        editor.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
+        editor.set_placeholder_text("Tell Bund what to do instead…");
+        self.approval_feedback = Some(editor);
+        self.hint = "Enter sends guidance · Alt+Enter newline · Esc returns to choices".into();
     }
     fn set_draft(&mut self, text: &str) {
         self.editor = TextArea::from(text.split('\n'));
@@ -413,7 +442,10 @@ impl Screen {
     }
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let (header, approval, conversation, composer) = regions(area, self.pending.is_some());
+        let (header, _, conversation, composer) = regions(area, self.pending.is_some());
+        if self.selection.area() != conversation {
+            self.selection.clear();
+        }
         let model = if self.snapshot.profile.model.is_empty() {
             "model not configured"
         } else {
@@ -483,18 +515,6 @@ impl Screen {
         frame.render_widget(Paragraph::new(headings), header);
         self.viewport_height = conversation.height as usize;
         if let Some(request) = &self.pending {
-            let prompt = if approval.height < 3 {
-                format!(
-                    "Ctrl+Y approve · Ctrl+N deny\nApproval: {}",
-                    clean(&request.tool_call.name)
-                )
-            } else {
-                format!("Approval required: {}\nCtrl+Y: approve once  Ctrl+N / Esc: deny · PgUp/PgDn review\nYour draft is preserved.", clean(&request.tool_call.name))
-            };
-            frame.render_widget(
-                Paragraph::new(prompt).style(Style::default().fg(Color::Yellow)),
-                approval,
-            );
             let preview = render::plain(
                 &format!(
                     "Workspace: {}\n{}",
@@ -506,16 +526,18 @@ impl Screen {
             );
             let max = preview.len().saturating_sub(conversation.height as usize);
             self.approval_scroll = self.approval_scroll.min(max);
-            frame.render_widget(
-                Paragraph::new(
-                    preview
-                        .into_iter()
-                        .skip(self.approval_scroll)
-                        .take(conversation.height as usize)
-                        .collect::<Vec<_>>(),
-                ),
-                conversation,
-            );
+            let visible = preview
+                .into_iter()
+                .skip(self.approval_scroll)
+                .take(conversation.height as usize)
+                .collect::<Vec<_>>();
+            if !self.selection.is_active() {
+                self.selection = SelectionView::new(
+                    conversation,
+                    visible.iter().cloned().map(SelectionRow::new).collect(),
+                );
+            }
+            frame.render_widget(Paragraph::new(visible), conversation);
         } else {
             if self.document_dirty || self.document_width != conversation.width {
                 self.document = self.build_document(conversation.width as usize);
@@ -541,6 +563,25 @@ impl Screen {
                 .rows
                 .get(self.top)
                 .map(|row| row.anchor.clone());
+            if !self.selection.is_active() {
+                self.selection = SelectionView::new(
+                    conversation,
+                    self.document
+                        .rows
+                        .iter()
+                        .skip(self.top)
+                        .take(conversation.height as usize)
+                        .map(|row| {
+                            let selected = SelectionRow::new(row.line.clone());
+                            if matches!(row.anchor.section.as_str(), "prompt" | "answer") {
+                                selected.copy_columns(2..conversation.width as usize)
+                            } else {
+                                selected
+                            }
+                        })
+                        .collect(),
+                );
+            }
             frame.render_widget(
                 Paragraph::new(
                     self.document
@@ -554,9 +595,10 @@ impl Screen {
                 conversation,
             );
         }
+        self.selection.paint(frame);
         let borders = if composer.width < 3 || composer.height < 2 {
             Borders::NONE
-        } else if composer.height < 3 {
+        } else if composer.height < 3 || (self.pending.is_some() && composer.height < 5) {
             Borders::LEFT | Borders::RIGHT
         } else {
             Borders::ALL
@@ -565,44 +607,64 @@ impl Screen {
             .borders(borders)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan));
-        if composer.height >= 3 && composer.width >= 3 {
+        if borders.contains(Borders::TOP) {
             let title = if header.height == 0
                 && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
             {
-                self.display_hint()
-            } else if self.pending.is_some() {
-                " Ask bund · draft paused "
+                self.display_hint().to_owned()
+            } else if self.approval_feedback.is_some() {
+                " Tell Bund what to do · Enter send · Esc back ".into()
+            } else if let Some(request) = &self.pending {
+                format!(
+                    " Approval: {} · draft saved ",
+                    clean(&request.tool_call.name)
+                )
             } else {
-                " Ask bund "
+                " Ask bund ".into()
             };
             block = block.title(title);
         }
         let input = block.inner(composer);
         frame.render_widget(block, composer);
-        frame.render_widget(&self.editor, input);
-        // The textarea retains its old scroll origin after a tiny window grows.
-        // Once its new viewport is known, reveal a short draft in full. Scrolling
-        // cannot move the cursor here because every line fits the new viewport.
-        if self.editor.lines().len() <= input.height as usize
-            && self.editor.lines().iter().all(|line| {
-                unicode_width::UnicodeWidthStr::width(line.as_str()) <= input.width as usize
-            })
-        {
-            let (row, col) = self.editor.scroll_offset();
-            if row != 0 || col != 0 {
-                self.editor.scroll((
-                    -(row.min(i16::MAX as u16) as i16),
-                    -(col.min(i16::MAX as u16) as i16),
-                ));
-                frame.render_widget(&self.editor, input);
+        if self.pending.is_some() && self.approval_feedback.is_none() {
+            let choices = if input.height >= 3 {
+                "1 Approve once\n2 Deny\n3 Tell Bund what to do"
+            } else if input.height == 2 {
+                "1 Approve once · 2 Deny\n3 Tell Bund what to do"
+            } else {
+                "1 Approve 2 Deny 3 Tell Bund what to do"
+            };
+            frame.render_widget(
+                Paragraph::new(choices).style(Style::default().fg(Color::Yellow)),
+                input,
+            );
+        } else {
+            let editor = self.approval_feedback.as_mut().unwrap_or(&mut self.editor);
+            frame.render_widget(&*editor, input);
+            // The textarea retains its old scroll origin after a tiny window grows.
+            // Once its new viewport is known, reveal a short draft in full. Scrolling
+            // cannot move the cursor here because every line fits the new viewport.
+            if editor.lines().len() <= input.height as usize
+                && editor.lines().iter().all(|line| {
+                    unicode_width::UnicodeWidthStr::width(line.as_str()) <= input.width as usize
+                })
+            {
+                let (row, col) = editor.scroll_offset();
+                if row != 0 || col != 0 {
+                    editor.scroll((
+                        -(row.min(i16::MAX as u16) as i16),
+                        -(col.min(i16::MAX as u16) as i16),
+                    ));
+                    frame.render_widget(&*editor, input);
+                }
             }
         }
         if header.height == 0
             && composer.height > 0
-            && composer.height < 3
+            && !borders.contains(Borders::TOP)
             && (self.display_hint() == EXIT_CONFIRM || self.hint == EXIT_INSTRUCTION)
         {
-            // With only one or two rows available there is no header or title;
+            // A tiny composer can have no header or title;
             // temporarily show confirmation without changing the stored draft.
             frame.render_widget(
                 Paragraph::new(clean(self.display_hint())).style(Style::default().fg(Color::Cyan)),
@@ -639,7 +701,7 @@ impl Screen {
 }
 
 fn regions(area: Rect, pending: bool) -> (Rect, Rect, Rect, Rect) {
-    let input = if area.height >= 10 {
+    let input = if pending || area.height >= 10 {
         5
     } else if area.height >= 4 {
         3
@@ -648,18 +710,6 @@ fn regions(area: Rect, pending: bool) -> (Rect, Rect, Rect, Rect) {
     }
     .min(area.height);
     let remaining = area.height.saturating_sub(input);
-    let approvals = if pending {
-        if remaining >= 6 {
-            3
-        } else if remaining >= 3 {
-            2
-        } else {
-            1
-        }
-        .min(remaining)
-    } else {
-        0
-    };
     let preferred = if area.height >= 15 {
         4
     } else if area.height >= 10 {
@@ -667,12 +717,12 @@ fn regions(area: Rect, pending: bool) -> (Rect, Rect, Rect, Rect) {
     } else {
         1
     };
-    let header = preferred.min(remaining.saturating_sub(approvals + 1));
-    let middle = remaining.saturating_sub(approvals + header);
+    let header = preferred.min(remaining.saturating_sub(1));
+    let middle = remaining.saturating_sub(header);
     (
         Rect::new(area.x, area.y, area.width, header),
-        Rect::new(area.x, area.y + header, area.width, approvals),
-        Rect::new(area.x, area.y + header + approvals, area.width, middle),
+        Rect::new(area.x, area.y + header + middle, area.width, 0),
+        Rect::new(area.x, area.y + header, area.width, middle),
         Rect::new(
             area.x,
             area.bottom().saturating_sub(input),
@@ -790,20 +840,18 @@ async fn run_inner(
                         },
                         Event::Paste(text) => {
                             screen.reset_exit_confirmation();
-                            if screen.pending.is_none() { screen.editor.insert_str(clean(&text)); }
+                            screen.selection.clear();
+                            screen.paste(&text);
                             dirty = true;
                         },
                         Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved => {
                             screen.reset_exit_confirmation();
-                            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-                                if let Err(error) = scroll_history(&handle, &mut screen, mouse.kind == MouseEventKind::ScrollDown, 3).await {
-                                    screen.hint = error.to_string();
-                                    screen.notice(error.to_string());
-                                }
+                            if let Err(error) = mouse_action(&handle, &mut screen, mouse).await {
+                                screen.hint = error.to_string();
                             }
                             dirty = true;
                         },
-                        Event::Resize(_, _) => resize_reported = true,
+                        Event::Resize(_, _) => { screen.selection.clear(); resize_reported = true; },
                         _ => {},
                     }
                 }
@@ -820,6 +868,15 @@ async fn run_inner(
                         screen.notice(screen.hint.clone());
                         dirty = true;
                     },
+                }
+                if screen.clipboard_task.as_ref().is_some_and(|task| task.is_finished()) {
+                    let outcome = screen.clipboard_task.take().unwrap().await;
+                    screen.hint = match outcome {
+                        Ok(Ok(())) => "Copied selection to clipboard · Ctrl+End latest".into(),
+                        Ok(Err(error)) => format!("Could not copy selection: {error}"),
+                        Err(_) => "Clipboard copy stopped; select the text again to retry".into(),
+                    };
+                    dirty = true;
                 }
                 // Resize notifications can coalesce while a window is dragged.
                 // Query the current size even while idle, and invalidate the
@@ -944,6 +1001,7 @@ async fn poll_history(
             return Ok(true);
         }
         screen.transcript = loaded.transcript;
+        screen.selection.clear();
         screen.history_ceiling = Some(loaded.ceiling);
         screen.history_follow_pending = matches!(loaded.target, HistoryTarget::Latest);
         if !screen.history_follow_pending {
@@ -1220,12 +1278,16 @@ async fn apply_event(
             screen.hint = "Working · Esc cancels · draft stays editable".into();
         }
         EventKind::ApprovalRequired(request) => {
+            screen.approval_feedback = None;
+            screen.selection.clear();
             screen.pending = Some(request);
             screen.approval_scroll = 0;
             screen.snapshot.status = RunStatus::AwaitingApproval;
-            screen.hint = "Approval required · Ctrl+Y approve once · Ctrl+N deny".into();
+            screen.hint = "Choose 1 approve · 2 deny · 3 tell Bund what to do".into();
         }
         EventKind::ApprovalResolved { .. } => {
+            screen.approval_feedback = None;
+            screen.selection.clear();
             screen.pending = None;
             screen.snapshot.status = RunStatus::Running;
         }
@@ -1240,9 +1302,55 @@ async fn apply_event(
         EventKind::RunFinished {
             status, validation, ..
         } => {
+            if screen.pending.is_some() {
+                screen.selection.clear();
+            }
+            screen.approval_feedback = None;
             screen.pending = None;
             screen.snapshot = handle.snapshot().await?;
             screen.hint = format!("{status:?} · checks {validation:?} · Enter send · /help");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn mouse_action(
+    handle: &SessionHandle,
+    screen: &mut Screen,
+    mouse: MouseEvent,
+) -> Result<()> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            screen.selection.clear();
+            scroll_history(handle, screen, mouse.kind == MouseEventKind::ScrollDown, 3).await?;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if screen.selection.start(mouse.column, mouse.row) {
+                // Keep the text under the mouse fixed while the model continues.
+                screen
+                    .history_ceiling
+                    .get_or_insert(screen.transcript.cursor());
+                screen.history_follow_pending = false;
+                screen.follow = false;
+                screen.hint = "Drag to highlight · release to copy".into();
+            } else {
+                screen.selection.clear();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            screen.selection.drag(mouse.column, mouse.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            screen.selection.drag(mouse.column, mouse.row);
+            if let Some(text) = screen.selection.finish().filter(|text| !text.is_empty()) {
+                if screen.clipboard_task.is_none() {
+                    screen.clipboard_task = Some(tokio::spawn(clipboard::copy(text)));
+                    screen.hint = "Copying selection…".into();
+                } else {
+                    screen.hint = "Clipboard copy is still finishing; select again to retry".into();
+                }
+            }
         }
         _ => {}
     }
@@ -1254,6 +1362,7 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
     if key.kind == KeyEventKind::Release {
         return Ok(false);
     }
+    screen.selection.clear();
     if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         return if key.kind == KeyEventKind::Press {
@@ -1271,6 +1380,7 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         }
         (KeyCode::Enter, mods)
             if !mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                && screen.pending.is_none()
                 && screen.draft().trim() == "/exit" =>
         {
             screen.hint = EXIT_INSTRUCTION.into();
@@ -1297,10 +1407,56 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
         }
         _ => {}
     }
-    if let Some(request) = &screen.pending {
-        if let Some(decision) = approval_key(key) {
-            handle.answer_approval(&request.id, decision).await?;
-            screen.pending = None;
+    if let Some(id) = screen.pending.as_ref().map(|request| request.id.clone()) {
+        if let Some(editor) = &mut screen.approval_feedback {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    screen.approval_feedback = None;
+                    screen.hint = "Choose 1 approve · 2 deny · 3 tell Bund what to do".into();
+                }
+                (KeyCode::Enter, mods)
+                    if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                {
+                    editor.insert_newline();
+                }
+                (KeyCode::Char('j'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                    editor.insert_newline();
+                }
+                (KeyCode::Enter, _) => {
+                    let feedback = editor.lines().join("\n");
+                    anyhow::ensure!(
+                        !feedback.trim().is_empty(),
+                        "Enter guidance for Bund, or press Esc to return to the choices."
+                    );
+                    anyhow::ensure!(
+                        feedback.len() <= bund_core::MAX_APPROVAL_FEEDBACK_BYTES,
+                        "Guidance is too long; use at most 16 KiB."
+                    );
+                    handle
+                        .answer_approval(&id, ApprovalDecision::DenyWithFeedback { feedback })
+                        .await?;
+                    screen.approval_feedback = None;
+                    screen.pending = None;
+                    screen.hint =
+                        "Guidance sent · proposed action denied · original draft restored".into();
+                }
+                _ => {
+                    editor.input(key);
+                }
+            }
+        } else if let Some(choice) = approval_key(key) {
+            let decision = match choice {
+                ApprovalChoice::Approve => Some(ApprovalDecision::ApproveOnce),
+                ApprovalChoice::Deny => Some(ApprovalDecision::Deny),
+                ApprovalChoice::Feedback => {
+                    screen.start_approval_feedback();
+                    None
+                }
+            };
+            if let Some(decision) = decision {
+                handle.answer_approval(&id, decision).await?;
+                screen.pending = None;
+            }
         }
         return Ok(false);
     }
@@ -1348,15 +1504,28 @@ async fn key_action(handle: &SessionHandle, screen: &mut Screen, key: KeyEvent) 
     Ok(false)
 }
 
-fn approval_key(key: KeyEvent) -> Option<ApprovalDecision> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    Deny,
+    Feedback,
+}
+
+fn approval_key(key: KeyEvent) -> Option<ApprovalChoice> {
+    if key.kind != crossterm::event::KeyEventKind::Press {
+        return None;
+    }
     match key.code {
+        KeyCode::Char('1') if key.modifiers.is_empty() => Some(ApprovalChoice::Approve),
+        KeyCode::Char('2') if key.modifiers.is_empty() => Some(ApprovalChoice::Deny),
+        KeyCode::Char('3') if key.modifiers.is_empty() => Some(ApprovalChoice::Feedback),
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalDecision::ApproveOnce)
+            Some(ApprovalChoice::Approve)
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalDecision::Deny)
+            Some(ApprovalChoice::Deny)
         }
-        KeyCode::Esc => Some(ApprovalDecision::Deny),
+        KeyCode::Esc => Some(ApprovalChoice::Deny),
         _ => None,
     }
 }
@@ -1779,6 +1948,8 @@ mod tests {
         .await
         .unwrap();
         screen.set_draft("preserve while cancelling");
+        screen.start_approval_feedback();
+        screen.paste("unsent guidance");
         start_history_load(&mut screen, std::future::pending());
         assert!(!key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
         assert!(screen.pending.is_some());
@@ -1787,8 +1958,16 @@ mod tests {
         assert!(key_action(&handle, &mut screen, ctrl_c()).await.unwrap());
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let EventKind::RunFinished { status, .. } = events.recv().await.unwrap().kind {
-                    assert_eq!(status, RunStatus::Cancelled);
+                let event = events.recv().await.unwrap();
+                let finished = matches!(
+                    event.kind,
+                    EventKind::RunFinished {
+                        status: RunStatus::Cancelled,
+                        ..
+                    }
+                );
+                apply_event(&handle, &mut screen, event).await.unwrap();
+                if finished {
                     break;
                 }
             }
@@ -1796,6 +1975,166 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(screen.draft(), "preserve while cancelling");
+        assert!(screen.approval_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn numbered_choices_approve_or_deny_only_the_pending_action() {
+        for (choice, approved) in [('1', true), ('2', false)] {
+            let (handle, workspace, _data) = exit_fixture().await;
+            let mut events = handle.attach().await.unwrap().events;
+            handle
+                .run_tool(
+                    "apply_patch",
+                    serde_json::json!({"path":"decision.txt", "content":"approved content"}),
+                )
+                .await
+                .unwrap();
+            let mut screen = test_screen();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while screen.pending.is_none() {
+                    apply_event(&handle, &mut screen, events.recv().await.unwrap())
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            screen.set_draft("saved draft");
+            key_action(
+                &handle,
+                &mut screen,
+                KeyEvent::new(KeyCode::Char(choice), KeyModifiers::NONE),
+            )
+            .await
+            .unwrap();
+            assert!(screen.pending.is_none());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap().kind,
+                        EventKind::RunFinished { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(workspace.path().join("decision.txt").exists(), approved);
+            assert_eq!(screen.draft(), "saved draft");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_feedback_preserves_the_draft_and_rejects_invalid_input_before_reply() {
+        use ratatui_textarea::CursorMove;
+        let (handle, workspace, _data) = exit_fixture().await;
+        let mut events = handle.attach().await.unwrap().events;
+        handle
+            .run_tool(
+                "apply_patch",
+                serde_json::json!({"path":"rejected.txt", "content":"must not be written"}),
+            )
+            .await
+            .unwrap();
+        let mut screen = test_screen();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while screen.pending.is_none() {
+                apply_event(&handle, &mut screen, events.recv().await.unwrap())
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        screen.set_draft("original draft\n世界");
+        screen.editor.move_cursor(CursorMove::Top);
+        screen.editor.move_cursor(CursorMove::Head);
+        screen.editor.start_selection();
+        screen.editor.move_cursor(CursorMove::End);
+        let cursor = screen.editor.cursor();
+        let selection = screen.editor.selection_range();
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        screen.paste("use option ");
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            screen.approval_feedback.as_ref().unwrap().lines(),
+            &["use option 1"]
+        );
+        assert!(
+            screen.pending.is_some(),
+            "digits in guidance must not approve"
+        );
+        key_action(
+            &handle,
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert!(screen.approval_feedback.is_none());
+        assert!(
+            screen.pending.is_some(),
+            "Esc from guidance returns to the menu"
+        );
+        screen.start_approval_feedback();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(key_action(&handle, &mut screen, enter).await.is_err());
+        screen.paste(&"x".repeat(bund_core::MAX_APPROVAL_FEEDBACK_BYTES + 1));
+        assert!(key_action(&handle, &mut screen, enter).await.is_err());
+        assert!(screen.pending.is_some());
+        screen.start_approval_feedback();
+        let guidance = "Inspect the existing file instead; do not create a new one.";
+        screen.paste(guidance);
+        key_action(&handle, &mut screen, enter).await.unwrap();
+        assert!(screen.pending.is_none());
+        assert!(screen.approval_feedback.is_none());
+        assert_eq!(screen.draft(), "original draft\n世界");
+        assert_eq!(screen.editor.cursor(), cursor);
+        assert_eq!(screen.editor.selection_range(), selection);
+        let mut recorded_feedback = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let EventKind::ApprovalResolved {
+                    decision: ApprovalDecision::DenyWithFeedback { feedback },
+                    ..
+                } = &event.kind
+                {
+                    assert_eq!(feedback, guidance);
+                    recorded_feedback = true;
+                }
+                if matches!(event.kind, EventKind::RunFinished { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(recorded_feedback);
+        assert!(!workspace.path().join("rejected.txt").exists());
+        let mut idle = test_screen();
+        key_action(
+            &handle,
+            &mut idle,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(idle.draft(), "2", "numbers type normally outside approval");
     }
 
     #[test]
@@ -1831,14 +2170,82 @@ mod tests {
             fingerprint: "fixture".into(),
             workspace: PathBuf::from("."),
         });
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| screen.render(frame)).unwrap();
-        assert!(buffer_row(terminal.backend(), 4).contains("Approval required"));
-        assert!(buffer_row(terminal.backend(), 5).contains("Ctrl+Y"));
-        assert!(buffer_row(terminal.backend(), 8).contains("exact proposed patch"));
-        assert!(buffer_row(terminal.backend(), 19).contains("draft paused"));
-        assert!(buffer_row(terminal.backend(), 20).contains("Keep this draft"));
-        assert_eq!(terminal.backend().buffer()[(0, 19)].fg, Color::Cyan);
+        for (width, height) in [
+            (80, 24),
+            (50, 16),
+            (100, 30),
+            (40, 8),
+            (40, 1),
+            (80, 4),
+            (80, 3),
+            (80, 2),
+            (80, 1),
+        ] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let (header, approval, preview, composer) =
+                regions(Rect::new(0, 0, width, height), true);
+            assert_eq!(header.bottom(), preview.y);
+            assert_eq!(preview.bottom(), approval.y);
+            assert_eq!(approval.bottom(), composer.y);
+            assert_eq!(approval.height, 0);
+            assert_eq!(composer.bottom(), height);
+            let controls = (composer.y..composer.bottom())
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                controls.contains("1 Approve"),
+                "{width}x{height}: {controls}"
+            );
+            assert!(controls.contains("2 Deny"), "{width}x{height}: {controls}");
+            assert!(
+                controls.contains("3 Tell Bund what to do"),
+                "{width}x{height}: {controls}"
+            );
+            assert_eq!(screen.draft(), "Keep this draft\nsecond line");
+            if height >= 16 {
+                assert!(
+                    buffer_row(terminal.backend(), composer.y).contains("Approval: apply_patch")
+                );
+                assert!(
+                    buffer_row(terminal.backend(), preview.y + 1).contains("exact proposed patch")
+                );
+                assert!(buffer_row(terminal.backend(), composer.y).contains("draft saved"));
+                assert!(!controls.contains("Keep this draft"));
+                assert_eq!(terminal.backend().buffer()[(0, composer.y)].fg, Color::Cyan);
+            }
+            assert!(!screen.confirm_exit_at(Instant::now()));
+            terminal.draw(|frame| screen.render(frame)).unwrap();
+            let visible = (0..height)
+                .map(|row| buffer_row(terminal.backend(), row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                visible.contains(EXIT_CONFIRM),
+                "{width}x{height}: {visible}"
+            );
+            screen.reset_exit_confirmation();
+        }
+    }
+
+    #[test]
+    fn approval_choices_use_the_composer_without_an_extra_strip() {
+        for height in 0..=40 {
+            for width in [1, 8, 24, 80] {
+                let area = Rect::new(2, 3, width, height);
+                let (header, approval, preview, composer) = regions(area, true);
+                assert_eq!(header.y, area.y);
+                assert_eq!(header.bottom(), preview.y);
+                assert_eq!(preview.bottom(), approval.y);
+                assert_eq!(approval.bottom(), composer.y);
+                assert_eq!(composer.bottom(), area.bottom());
+                assert_eq!(approval.height, 0);
+                if height > 0 {
+                    assert!(composer.height > 0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1914,6 +2321,73 @@ mod tests {
                 .iter()
                 .all(|row| row.line.width() <= width));
         }
+    }
+
+    #[tokio::test]
+    async fn mouse_selection_freezes_visible_response_and_preserves_the_draft() {
+        let (handle, _workspace, _data) = exit_fixture().await;
+        let mut screen = test_screen();
+        event(
+            &mut screen,
+            EventKind::RunStarted {
+                prompt: "inspect".into(),
+            },
+        );
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: "Selected 世界 e\u{301}".into(),
+            },
+        );
+        screen.set_draft("keep my draft");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        let row = (0..24)
+            .find(|&row| buffer_row(terminal.backend(), row).contains("Selected"))
+            .unwrap();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        mouse_action(
+            &handle,
+            &mut screen,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+        )
+        .await
+        .unwrap();
+        mouse_action(
+            &handle,
+            &mut screen,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 79, row),
+        )
+        .await
+        .unwrap();
+        event(
+            &mut screen,
+            EventKind::TextDelta {
+                text: " later streaming text".into(),
+            },
+        );
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(!buffer_row(terminal.backend(), row).contains("later streaming"));
+        assert_ne!(terminal.backend().buffer()[(2, row)].bg, Color::Reset);
+        // Complete selection directly so this test never touches the host clipboard.
+        assert_eq!(
+            screen.selection.finish().as_deref(),
+            Some("Selected 世界 e\u{301}")
+        );
+        assert_eq!(screen.draft(), "keep my draft");
+        assert!(!screen.follow);
+        terminal.backend_mut().resize(50, 24);
+        terminal.draw(|frame| screen.render(frame)).unwrap();
+        assert!(
+            !screen.selection.is_active(),
+            "resize must clear stale cell coordinates"
+        );
+        assert_eq!(screen.draft(), "keep my draft");
     }
 
     #[test]
@@ -2046,19 +2520,31 @@ mod tests {
         );
     }
     #[test]
-    fn regular_typing_cannot_accidentally_approve() {
+    fn approval_choices_accept_numbers_and_legacy_shortcuts_only_on_press() {
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
-            Some(ApprovalDecision::ApproveOnce)
+            Some(ApprovalChoice::Approve)
         );
         assert_eq!(
             approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(ApprovalDecision::Deny)
+            Some(ApprovalChoice::Deny)
         );
+        for (number, choice) in [
+            ('1', ApprovalChoice::Approve),
+            ('2', ApprovalChoice::Deny),
+            ('3', ApprovalChoice::Feedback),
+        ] {
+            let mut key = KeyEvent::new(KeyCode::Char(number), KeyModifiers::NONE);
+            assert_eq!(approval_key(key), Some(choice));
+            key.kind = crossterm::event::KeyEventKind::Repeat;
+            assert_eq!(approval_key(key), None);
+            key.kind = crossterm::event::KeyEventKind::Release;
+            assert_eq!(approval_key(key), None);
+        }
     }
     #[test]
     fn history_restores_draft_and_keeps_multiline_prompts() {

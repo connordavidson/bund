@@ -219,6 +219,139 @@ async fn denied_patch_and_plan_mode_leave_bytes_unchanged() {
 }
 
 #[tokio::test]
+async fn denial_feedback_reaches_the_next_request_and_is_durable_without_editing() {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("file"), "original").unwrap();
+    let provider = Arc::new(FakeProvider::new(vec![
+        response(vec![call(
+            "w",
+            "apply_patch",
+            json!({"path":"file","content":"changed"}),
+        )]),
+        response(vec![]),
+    ]));
+    let store = Arc::new(SqliteStore::open(data.path()).unwrap());
+    let agent = engine(store.clone(), provider.clone());
+    let session = agent
+        .create_session(SessionOptions::new(
+            repo.path().into(),
+            ModelProfile::new("fake", "fixture"),
+        ))
+        .await
+        .unwrap();
+    let mut events = session.attach().await.unwrap().events;
+    session.submit("Edit file".into()).await.unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let EventKind::ApprovalRequired(request) = events.recv().await.unwrap().kind {
+                break request;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    // Invalid submissions must leave the same approval available for correction.
+    for feedback in [
+        String::new(),
+        " \n\t".into(),
+        "x".repeat(MAX_APPROVAL_FEEDBACK_BYTES + 1),
+        "é".repeat(MAX_APPROVAL_FEEDBACK_BYTES / 2 + 1),
+    ] {
+        assert!(matches!(
+            session
+                .answer_approval(&request.id, ApprovalDecision::DenyWithFeedback { feedback })
+                .await,
+            Err(Error::Invalid(_))
+        ));
+        let snapshot = session.snapshot().await.unwrap();
+        assert_eq!(snapshot.status, RunStatus::AwaitingApproval);
+        assert_eq!(snapshot.pending_approval.unwrap().id, request.id);
+    }
+    let feedback =
+        "Keep the file unchanged. Explain the proposed edit instead.\nUse plain language.";
+    let decision = ApprovalDecision::DenyWithFeedback {
+        feedback: feedback.into(),
+    };
+    session
+        .answer_approval(&request.id, decision.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        finish(&session, events, false).await.0,
+        RunStatus::Completed
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file")).unwrap(),
+        "original"
+    );
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let result = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_results)
+            .find(|result| result.call_id == "w")
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("user denied apply_patch"));
+        assert!(result.content.contains(feedback));
+    }
+
+    let saved = session.snapshot().await.unwrap();
+    let journal = store.events_after(&saved.id, 0, 256).await.unwrap();
+    assert!(journal.iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ApprovalResolved { id, decision: saved_decision }
+            if id == &request.id && saved_decision == &decision
+    )));
+    assert!(!journal
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ToolStarted { .. })));
+    let mut transcript = Transcript::default();
+    for event in &journal {
+        transcript.apply(event);
+    }
+    let tool = &transcript.runs().back().unwrap().tools[0];
+    assert_eq!(tool.status, TranscriptToolStatus::Denied);
+    assert!(tool.output.contains(feedback));
+    let reopened = engine(store, provider)
+        .open_session(&saved.id)
+        .await
+        .unwrap();
+    assert!(reopened
+        .snapshot()
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.tool_results)
+        .any(|result| result.is_error && result.content.contains(feedback)));
+}
+
+#[test]
+fn approval_decision_serialization_preserves_existing_journal_variants() {
+    for (decision, encoded) in [
+        (ApprovalDecision::ApproveOnce, json!("approve_once")),
+        (ApprovalDecision::Deny, json!("deny")),
+        (
+            ApprovalDecision::DenyWithFeedback {
+                feedback: "Explain instead".into(),
+            },
+            json!({"deny_with_feedback":{"feedback":"Explain instead"}}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&decision).unwrap(), encoded);
+        assert_eq!(
+            serde_json::from_value::<ApprovalDecision>(encoded).unwrap(),
+            decision
+        );
+    }
+}
+
+#[tokio::test]
 async fn stale_approval_fails_and_cannot_be_answered_twice() {
     let repo = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

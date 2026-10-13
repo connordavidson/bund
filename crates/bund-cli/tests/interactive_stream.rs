@@ -456,16 +456,16 @@ impl Pty {
                 .collect::<Vec<_>>()
                 .join("\n");
             let draft_visible =
-                draft.is_none_or(|text| text.lines().all(|line| editor.contains(line)));
-            let top_info = screen.rows(0, cols).take(7).collect::<Vec<_>>().join("\n");
+                approval || draft.is_none_or(|text| text.lines().all(|line| editor.contains(line)));
             let approval_visible = !approval
-                || (top_info.contains("Approval required: apply_patch")
-                    && top_info.contains("Ctrl+Y")
-                    && top_info.contains("Ctrl+N")
-                    && editor.contains("draft paused"));
+                || (editor.contains("Approval: apply_patch")
+                    && editor.contains("1 Approve once")
+                    && editor.contains("2 Deny")
+                    && editor.contains("3 Tell Bund what to do")
+                    && editor.contains("draft saved"));
             if screen.alternate_screen()
                 && bordered
-                && editor.contains("Ask bund")
+                && (approval || editor.contains("Ask bund"))
                 && draft_visible
                 && approval_visible
             {
@@ -655,10 +655,85 @@ fn first_interrupt_cancels_pending_approval_without_closing_or_losing_draft() {
     terminal.interrupt_once();
     terminal.wait_screen("approval cancelled while Bund remains open", |screen| {
         screen.contents().contains("Cancelled")
-            && !screen.contents().contains("Approval required: apply_patch")
+            && !screen.contents().contains("Approval: apply_patch")
     });
     terminal.wait_composer(Some(DRAFT), false);
     terminal.assert_occupied();
+    assert!(!dir.path().join("created.txt").exists());
+    terminal.finish();
+    worker.join().unwrap();
+}
+
+#[test]
+fn numbered_feedback_choice_sends_guidance_and_restores_original_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (advance, gate) = mpsc::channel();
+    let (recorded, requests) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = accept_request(&listener);
+        let item = message("feedback-message", "Preparing feedback review\n");
+        let first = start("feedback-response", &item) + &delta("Preparing feedback review\n");
+        let call = json!({"type":"function_call","id":"feedback-call","call_id":"feedback-call",
+            "name":"apply_patch","arguments":json!({"path":"created.txt","content":"unapproved"}).to_string(),
+            "status":"completed"});
+        let completed = finish("feedback-response", &[item, call]);
+        header(&mut socket, first.len() + completed.len());
+        socket.write_all(first.as_bytes()).unwrap();
+        socket.flush().unwrap();
+        gate.recv_timeout(WAIT).unwrap();
+        socket.write_all(completed.as_bytes()).unwrap();
+        drop(socket);
+        let (mut socket, request) = accept_request(&listener);
+        recorded.send(request).unwrap();
+        let item = message("feedback-answer", "Guidance acknowledged\n");
+        let response = start("feedback-result", &item)
+            + &delta("Guidance acknowledged\n")
+            + &finish("feedback-result", &[item]);
+        header(&mut socket, response.len());
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let mut terminal = Pty::spawn(dir.path(), &endpoint);
+    terminal.wait_composer(None, false);
+    terminal.send("prepare an edit\r");
+    terminal.wait_visible("Preparing feedback review");
+    terminal.send(&format!("\x1b[200~{DRAFT}\x1b[201~"));
+    terminal.wait_composer(Some(DRAFT), false);
+    advance.send(()).unwrap();
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.send("3");
+    terminal.wait_visible("Tell Bund what to do · Enter send");
+    terminal.send("temporary guidance");
+    terminal.send("\x1b");
+    terminal.wait_composer(Some(DRAFT), true);
+    terminal.send("3");
+    terminal.wait_visible("Tell Bund what to do · Enter send");
+    let guidance = "Use option 1: inspect 世界 instead.\nDo not create the file.";
+    terminal.send(&format!("\x1b[200~{guidance}\x1b[201~"));
+    terminal.resize(18, 62);
+    terminal.wait_screen("guidance retained while resizing", |screen| {
+        let (rows, cols) = screen.size();
+        let editor = screen
+            .rows(0, cols)
+            .skip((rows - 5) as usize)
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.contains("Use option 1: inspect 世界 instead.")
+            && editor.contains("Do not create the file.")
+    });
+    terminal.send("\r");
+    terminal.wait_visible("Guidance acknowledged");
+    terminal.wait_visible("Completed");
+    terminal.wait_composer(Some(DRAFT), false);
+    let next = requests.recv_timeout(WAIT).unwrap();
+    assert!(next["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "function_call_output"
+            && item["output"]
+                .as_str()
+                .is_some_and(|text| text.contains(guidance))
+    }));
     assert!(!dir.path().join("created.txt").exists());
     terminal.finish();
     worker.join().unwrap();
@@ -738,6 +813,34 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         !String::from_utf8_lossy(&terminal.received).contains("REASONING_ONLY_WHEN_EXPANDED"),
         "hidden reasoning must never be painted before expansion"
     );
+    // SGR mouse coordinates are one-based. Drag across the response, including
+    // both cells of its final wide glyph, while the fixture holds the stream.
+    let mouse_row = response_row + 1;
+    terminal.send(&format!("\x1b[<0;3;{mouse_row}M\x1b[<32;20;{mouse_row}M"));
+    let highlight = vt100::Color::Rgb(35, 85, 145);
+    terminal.wait_screen("dragged response highlighted", |screen| {
+        // vt100 stores the wide glyph's style on its leading cell; the
+        // continuation cell deliberately has default attributes.
+        [2, 3, 18]
+            .into_iter()
+            .all(|col| screen.cell(response_row as u16, col).unwrap().bgcolor() == highlight)
+            && screen
+                .cell(response_row as u16, 19)
+                .unwrap()
+                .is_wide_continuation()
+            && screen.cell(response_row as u16, 0).unwrap().bgcolor() != highlight
+            && screen.contents().contains("Streaming ready 界")
+    });
+    terminal.wait_composer(Some(DRAFT), false);
+    // Clear before releasing, so this test never starts a real clipboard helper.
+    terminal.send("\x1b[1;5F");
+    terminal.wait_screen("selection cleared and live following restored", |screen| {
+        screen.cell(response_row as u16, 2).unwrap().bgcolor() != highlight
+            && !screen.contents().contains("Browsing history")
+            && screen.contents().contains("Streaming ready 界")
+    });
+    terminal.send(&format!("\x1b[<0;20;{mouse_row}m"));
+    terminal.wait_composer(Some(DRAFT), false);
     terminal.send("\x0f"); // Ctrl+O expands inline details, preserving the draft.
     terminal.wait_visible("REASONING_ONLY_WHEN_EXPANDED");
     let screen = terminal.screen.screen();
@@ -767,24 +870,24 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
         .screen
         .screen()
         .rows(0, 90)
-        .skip(7)
-        .take(12)
+        .skip(4)
+        .take(15)
         .collect::<Vec<_>>();
     terminal.send("\x1b[6~"); // PageDown scrolls only the long approval preview.
     terminal.wait_screen("paged approval preview", |screen| {
-        screen.rows(0, 90).skip(7).take(12).collect::<Vec<_>>() != review_before
+        screen.rows(0, 90).skip(4).take(15).collect::<Vec<_>>() != review_before
     });
     terminal.wait_composer(Some(DRAFT), true);
     let review_before_wheel = terminal
         .screen
         .screen()
         .rows(0, 90)
-        .skip(7)
-        .take(12)
+        .skip(4)
+        .take(15)
         .collect::<Vec<_>>();
     terminal.wheel(false);
     terminal.wait_screen("mouse wheel scrolls approval preview", |screen| {
-        screen.rows(0, 90).skip(7).take(12).collect::<Vec<_>>() != review_before_wheel
+        screen.rows(0, 90).skip(4).take(15).collect::<Vec<_>>() != review_before_wheel
     });
     terminal.assert_occupied();
     terminal.wait_composer(Some(DRAFT), true);
@@ -795,7 +898,7 @@ fn unicode_draft_survives_stream_approval_resize_and_cancel_with_inert_escapes()
     terminal.wait_composer(Some(DRAFT), true);
     terminal.resize(30, 100);
     terminal.wait_composer(Some(DRAFT), true);
-    terminal.send("\x0e"); // Ctrl+N denies without touching the composer.
+    terminal.send("2"); // The numbered choice denies and restores the composer.
     terminal.wait_visible("Denial acknowledged");
     terminal.wait_visible("Completed");
     let followup = fixture.requests.recv_timeout(WAIT).unwrap();

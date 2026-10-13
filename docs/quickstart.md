@@ -81,8 +81,12 @@ bund --check 'cargo test'
 
 Ask for a small change. The fullscreen interface keeps workspace and status
 information at the top and a cyan query box at the bottom. Enter submits;
-Ctrl+J adds a newline. Your draft remains visible during streaming and
-approvals. Ctrl+Y approves the displayed action once; Ctrl+N or Esc denies it.
+Ctrl+J adds a newline. Your draft remains visible during streaming. Approval
+choices appear inside the query box: **1 Approve once**, **2 Deny**, and
+**3 Tell Bund what to do**. Choosing 3 opens a guidance editor; Enter declines
+the proposed action and sends your guidance to Bund, while Esc returns to the
+choices. Your original draft is preserved and returns after the decision or
+cancellation.
 The first Ctrl+C cancels active work and keeps your draft. Completed edits
 remain after cancellation.
 
@@ -91,9 +95,14 @@ separates them, and continuation lines align with the message text.
 
 Ctrl+O expands orange activity boxes beneath responses, including tools and
 provider-supplied reasoning summaries; press it again to collapse them.
+Drag across response text to highlight it, then release the mouse to copy the
+selection to your clipboard. Copying preserves the displayed line breaks and
+omits the speaker dot. Scrolling or typing clears the highlight; Ctrl+End returns
+to the latest output. On Linux, install `wl-copy` (Wayland), `xclip`, or `xsel` (X11).
 The mouse wheel and PageUp/PageDown scroll Bund's conversation without following
 new output, and Ctrl+End returns to the latest output. During approvals, they
-scroll the review preview while the decision controls remain visible at the top.
+scroll the review preview while the choices or guidance editor stay inside the
+query box.
 
 When idle, use `/diff` to review changes and `/check` to run configured checks.
 Checks use the same command approval flow. To exit, press **Ctrl+C twice
